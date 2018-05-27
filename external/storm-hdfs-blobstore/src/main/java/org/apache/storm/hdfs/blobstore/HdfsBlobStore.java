@@ -18,6 +18,16 @@
 
 package org.apache.storm.hdfs.blobstore;
 
+import java.io.ByteArrayOutputStream;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.security.AccessController;
+import java.security.PrivilegedAction;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.Map;
+import javax.security.auth.Subject;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.security.UserGroupInformation;
@@ -32,21 +42,13 @@ import org.apache.storm.generated.KeyAlreadyExistsException;
 import org.apache.storm.generated.KeyNotFoundException;
 import org.apache.storm.generated.ReadableBlobMeta;
 import org.apache.storm.generated.SettableBlobMeta;
+import org.apache.storm.nimbus.ILeaderElector;
 import org.apache.storm.nimbus.NimbusInfo;
 import org.apache.storm.utils.Utils;
+import org.apache.storm.utils.WrappedKeyAlreadyExistsException;
+import org.apache.storm.utils.WrappedKeyNotFoundException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import javax.security.auth.Subject;
-import java.io.ByteArrayOutputStream;
-import java.io.FileNotFoundException;
-import java.io.IOException;
-import java.io.InputStream;
-import java.security.AccessController;
-import java.security.PrivilegedAction;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.Map;
 
 import static org.apache.storm.blobstore.BlobStoreAclHandler.*;
 
@@ -114,7 +116,7 @@ public class HdfsBlobStore extends BlobStore {
     }
 
     @Override
-    public void prepare(Map<String, Object> conf, String overrideBase, NimbusInfo nimbusInfo) {
+    public void prepare(Map<String, Object> conf, String overrideBase, NimbusInfo nimbusInfo, ILeaderElector leaderElector) {
         this.conf = conf;
         prepareInternal(conf, overrideBase, null);
     }
@@ -187,7 +189,7 @@ public class HdfsBlobStore extends BlobStore {
         BlobStoreAclHandler.validateSettableACLs(key, meta.get_acl());
         aclHandler.hasPermissions(meta.get_acl(), READ | WRITE | ADMIN, who, key);
         if (hbs.exists(DATA_PREFIX + key)) {
-            throw new KeyAlreadyExistsException(key);
+            throw new WrappedKeyAlreadyExistsException(key);
         }
         BlobStoreFileOutputStream mOut = null;
         try {
@@ -236,7 +238,7 @@ public class HdfsBlobStore extends BlobStore {
             try {
                 in = pf.getInputStream();
             } catch (FileNotFoundException fnf) {
-                throw new KeyNotFoundException(key);
+                throw new WrappedKeyNotFoundException(key);
             }
             ByteArrayOutputStream out = new ByteArrayOutputStream();
             byte[] buffer = new byte[2048];
@@ -276,6 +278,16 @@ public class HdfsBlobStore extends BlobStore {
             throw new RuntimeException(e);
         }
         return rbm;
+    }
+
+    /**
+     * Sets leader elector (only used by LocalFsBlobStore to help sync blobs between Nimbi
+     *
+     * @param leaderElector
+     */
+    @Override
+    public void setLeaderElector(ILeaderElector leaderElector) {
+        // NO-OP
     }
 
     @Override

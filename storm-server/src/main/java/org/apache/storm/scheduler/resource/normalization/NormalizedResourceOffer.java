@@ -43,10 +43,18 @@ public class NormalizedResourceOffer implements NormalizedResourcesWithMemory {
         this.normalizedResources = new NormalizedResources(normalizedResourceMap);
     }
 
+    /**
+     * Create an offer with all resources set to 0.
+     */
     public NormalizedResourceOffer() {
-        this((Map<String, ? extends Number>) null);
+        normalizedResources = new NormalizedResources();
+        totalMemoryMb = 0.0;
     }
 
+    /**
+     * Copy Constructor.
+     * @param other what to copy.
+     */
     public NormalizedResourceOffer(NormalizedResourceOffer other) {
         this.totalMemoryMb = other.totalMemoryMb;
         this.normalizedResources = new NormalizedResources(other.normalizedResources);
@@ -57,6 +65,10 @@ public class NormalizedResourceOffer implements NormalizedResourcesWithMemory {
         return totalMemoryMb;
     }
 
+    /**
+     * Return these resources as a normalized map.
+     * @return the normalized map.
+     */
     public Map<String, Double> toNormalizedMap() {
         Map<String, Double> ret = normalizedResources.toNormalizedMap();
         ret.put(Constants.COMMON_TOTAL_MEMORY_RESOURCE_NAME, totalMemoryMb);
@@ -68,18 +80,26 @@ public class NormalizedResourceOffer implements NormalizedResourcesWithMemory {
         totalMemoryMb += other.getTotalMemoryMb();
     }
 
-    public void remove(NormalizedResourcesWithMemory other) {
-        normalizedResources.remove(other.getNormalizedResources());
+    /**
+     * Remove the resources in other from this.
+     * @param other the resources to be removed.
+     * @return true if one or more resources in other were larger than available resources in this, else false.
+     */
+    public boolean remove(NormalizedResourcesWithMemory other) {
+        boolean negativeResources = normalizedResources.remove(other.getNormalizedResources());
         totalMemoryMb -= other.getTotalMemoryMb();
         if (totalMemoryMb < 0.0) {
-            normalizedResources.throwBecauseResourceBecameNegative(
-                Constants.COMMON_TOTAL_MEMORY_RESOURCE_NAME, totalMemoryMb, other.getTotalMemoryMb());
-        };
+            negativeResources = true;
+            NormalizedResources.numNegativeResourceEvents.mark();
+            totalMemoryMb = 0.0;
+        }
+        return negativeResources;
     }
 
     /**
+     * Calculate the average percentage used.
      * @see NormalizedResources#calculateAveragePercentageUsedBy(org.apache.storm.scheduler.resource.normalization.NormalizedResources,
-     * double, double).
+     *     double, double)
      */
     public double calculateAveragePercentageUsedBy(NormalizedResourceOffer used) {
         return normalizedResources.calculateAveragePercentageUsedBy(
@@ -87,16 +107,18 @@ public class NormalizedResourceOffer implements NormalizedResourcesWithMemory {
     }
 
     /**
+     * Calculate the min percentage used of the resource.
      * @see NormalizedResources#calculateMinPercentageUsedBy(org.apache.storm.scheduler.resource.normalization.NormalizedResources, double,
-     * double)
+     *     double)
      */
     public double calculateMinPercentageUsedBy(NormalizedResourceOffer used) {
         return normalizedResources.calculateMinPercentageUsedBy(used.getNormalizedResources(), getTotalMemoryMb(), used.getTotalMemoryMb());
     }
 
     /**
+     * Check if resources might be able to fit.
      * @see NormalizedResources#couldHoldIgnoringSharedMemory(org.apache.storm.scheduler.resource.normalization.NormalizedResources, double,
-     * double).
+     *     double)
      */
     public boolean couldHoldIgnoringSharedMemory(NormalizedResourcesWithMemory other) {
         return normalizedResources.couldHoldIgnoringSharedMemory(
@@ -110,5 +132,25 @@ public class NormalizedResourceOffer implements NormalizedResourcesWithMemory {
     @Override
     public NormalizedResources getNormalizedResources() {
         return normalizedResources;
+    }
+
+    @Override
+    public String toString() {
+        return "Normalized resources: " + toNormalizedMap();
+    }
+
+    /**
+     * If a node or rack has a kind of resource not in a request, make that resource negative so when sorting that node or rack will
+     * be less likely to be selected.
+     * @param requestedResources the requested resources.
+     */
+    public void updateForRareResourceAffinity(NormalizedResourceRequest requestedResources) {
+        normalizedResources.updateForRareResourceAffinity(requestedResources.getNormalizedResources());
+    }
+
+    @Override
+    public void clear() {
+        this.totalMemoryMb = 0.0;
+        this.normalizedResources.clear();
     }
 }

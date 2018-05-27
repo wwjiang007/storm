@@ -48,6 +48,8 @@ storm.messaging.transport: "org.apache.storm.messaging.netty.Context"
 storm.nimbus.retry.times: 5
 storm.nimbus.retry.interval.millis: 2000
 storm.nimbus.retry.intervalceiling.millis: 60000
+storm.nimbus.zookeeper.acls.check: true
+storm.nimbus.zookeeper.acls.fixup: true
 storm.auth.simple-white-list.users: []
 storm.cluster.state.store: "org.apache.storm.cluster.ZKStateStorageFactory"
 storm.meta.serialization.delegate: "org.apache.storm.serialization.GzipThriftSerializationDelegate"
@@ -196,6 +198,9 @@ worker.log.level.reset.poll.secs: 30
 topology.worker.receiver.thread.count: 1
 
 # Executor metrics reporting interval.
+# Cause the ui only show built in metrics, we should keep sync with the built in metrics interval,
+# also the metrics consumer's collecting interval.
+# See topology.builtin.metrics.bucket.size.secs and storm.cluster.metrics.consumer.publish.interval.secs.
 executor.metrics.frequency.secs: 60
 
 task.heartbeat.frequency.secs: 3
@@ -385,3 +390,26 @@ worker.metrics:
 
 # The number of buckets for running statistics
 num.stat.buckets: 20
+
+# Metrics v2 configuration (optional)
+#storm.metrics.reporters:
+#  # Graphite Reporter
+#  - class: "org.apache.storm.metrics2.reporters.GraphiteStormReporter"
+#    daemons:
+#        - "supervisor"
+#        - "nimbus"
+#        - "worker"
+#    report.period: 60
+#    report.period.units: "SECONDS"
+#    graphite.host: "localhost"
+#    graphite.port: 2003
+#
+#  # Console Reporter
+#  - class: "org.apache.storm.metrics2.reporters.ConsoleStormReporter"
+#    daemons:
+#        - "worker"
+#    report.period: 10
+#    report.period.units: "SECONDS"
+#    filter:
+#        class: "org.apache.storm.metrics2.filters.RegexFilter"
+#        expression: ".*my_component.*emitted.*"

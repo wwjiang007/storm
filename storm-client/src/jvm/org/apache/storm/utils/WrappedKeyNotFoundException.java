@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -16,36 +16,22 @@
  * limitations under the License.
  */
 
-package org.apache.storm.rocketmq;
+package org.apache.storm.utils;
+
+import org.apache.storm.generated.KeyNotFoundException;
 
 /**
- * Interface for messages retry manager.
+ * Wraps the generated TException to allow getMessage() to return a valid string.
  */
-public interface MessageRetryManager {
-    /**
-     * Remove from the cache. Message with the id is successful.
-     * @param id message id
-     */
-    void ack(String id);
+public class WrappedKeyNotFoundException extends KeyNotFoundException {
+    public WrappedKeyNotFoundException(String msg) {
+        super(msg);
+    }
 
-    /**
-     * Remove from the cache. Message with the id is failed.
-     * Invoke retry logics if necessary.
-     * @param id message id
-     */
-    void fail(String id);
-
-    /**
-     * Mark message in the cache.
-     * @param message message
-     */
-    void mark(ConsumerMessage message);
-
-    /**
-     * Whether the message need retry.
-     * @param message ConsumerMessage
-     * @return true if need retry, otherwise false
-     */
-    boolean needRetry(ConsumerMessage message);
-
+    @Override
+    public String getMessage() {
+        return this.get_msg();
+    }
 }
+
+

@@ -210,12 +210,26 @@
             </roles>
             <timezone>-8</timezone>
         </developer>
+        <developer>
+            <id>roshannaik</id>
+            <name>Roshan Naik</name>
+            <email>roshannaik@apache.org</email>
+            <roles>
+                <role>Committer</role>
+            </roles>
+            <timezone>-8</timezone>
+        </developer>
+        <developer>
+            <id>Ethanlm</id>
+            <name>Ethan Li</name>
+            <email>ethanli@apache.org</email>
+            <roles>	
+                <role>Committer</role>
+            </roles>
+            <timezone>-6</timezone>
+        </developer>
+
     </developers>
-
-
-    <prerequisites>
-        <maven>3.0.0</maven>
-    </prerequisites>
 
     <scm>
         <connection>scm:git:https://git-wip-us.apache.org/repos/asf/storm.git</connection>
@@ -235,7 +249,6 @@
 
         <!-- dependency versions -->
         <clojure.version>1.7.0</clojure.version>
-        <java_jmx.version>0.3.1</java_jmx.version>
         <compojure.version>1.1.9</compojure.version>
         <hiccup.version>0.3.6</hiccup.version>
         <commons-compress.version>1.4.1</commons-compress.version>
@@ -260,7 +273,6 @@
         <httpclient.version>4.3.3</httpclient.version>
         <clojure.tools.cli.version>0.2.4</clojure.tools.cli.version>
         <jctools.version>2.0.1</jctools.version>
-        <disruptor.version>3.3.2</disruptor.version>
         <jgrapht.version>0.9.0</jgrapht.version>
         <guava.version>16.0.1</guava.version>
         <auto-service.version>1.0-rc3</auto-service.version>
@@ -284,7 +296,7 @@
         <kryo.version>3.0.3</kryo.version>
         <servlet.version>3.1.0</servlet.version>
         <joda-time.version>2.3</joda-time.version>
-        <thrift.version>0.9.3</thrift.version>
+        <thrift.version>0.11.0</thrift.version>
         <junit.version>4.11</junit.version>
         <metrics-clojure.version>2.5.1</metrics-clojure.version>
         <hdrhistogram.version>2.1.7</hdrhistogram.version>
@@ -297,7 +309,7 @@
         <solr.version>5.2.1</solr.version>
         <jpmml.version>1.0.22</jpmml.version>
         <jedis.version>2.9.0</jedis.version>
-        <rocketmq.version>4.0.0-incubating</rocketmq.version>
+        <rocketmq.version>4.2.0</rocketmq.version>
 
         <jackson.version>2.9.4</jackson.version>
         <!-- Kafka version used by old storm-kafka spout code -->
@@ -309,7 +321,7 @@
 
 
         <!-- Java and clojure build lifecycle test properties are defined here to avoid having to create a default profile -->
-        <java.unit.test.exclude>org.apache.storm.testing.IntegrationTest</java.unit.test.exclude>
+        <java.unit.test.exclude>org.apache.storm.testing.IntegrationTest, org.apache.storm.testing.PerformanceTest</java.unit.test.exclude>
         <java.unit.test.include>**/Test*.java, **/*Test.java, **/*TestCase.java</java.unit.test.include>    <!--maven surefire plugin default test list-->
         <java.integration.test.include>no.tests</java.integration.test.include>
         <!-- by default the clojure test set are all clojure tests that are not integration tests. This property is overridden in the profiles -->
@@ -607,10 +619,19 @@
             <id>all-tests</id>
             <properties>
                 <java.integration.test.include>**/*.java</java.integration.test.include>
+                <!-- add perf tests back in -->
+                <java.unit.test.exclude>org.apache.storm.testing.IntegrationTest</java.unit.test.exclude>
                 <clojure.test.set>*.*</clojure.test.set>
             </properties>
         </profile>
         <profile>
+            <id>performance-tests</id>
+            <properties>
+                <!-- add perf tests back in -->
+                <java.unit.test.exclude>org.apache.storm.testing.IntegrationTest</java.unit.test.exclude>
+            </properties>
+        </profile> 
+	<profile>
             <id>integration-tests-only</id>
             <properties>
                 <!--Java-->
@@ -890,11 +911,6 @@
                 <version>${jctools.version}</version>
             </dependency>
             <dependency>
-                <groupId>com.lmax</groupId>
-                <artifactId>disruptor</artifactId>
-                <version>${disruptor.version}</version>
-            </dependency>
-            <dependency>
                 <groupId>org.jgrapht</groupId>
                 <artifactId>jgrapht-core</artifactId>
                 <version>${jgrapht.version}</version>
@@ -943,6 +959,16 @@
             <dependency>
                 <groupId>io.dropwizard.metrics</groupId>
                 <artifactId>metrics-core</artifactId>
+                <version>${metrics.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.dropwizard.metrics</groupId>
+                <artifactId>metrics-ganglia</artifactId>
+                <version>${metrics.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.dropwizard.metrics</groupId>
+                <artifactId>metrics-graphite</artifactId>
                 <version>${metrics.version}</version>
             </dependency>
             <dependency>
@@ -1245,6 +1271,25 @@
                     </docletArtifact>
                     <useStandardDocletOptions>true</useStandardDocletOptions>
                 </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-enforcer-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>enforce-maven-version</id>
+                        <goals>
+                            <goal>enforce</goal>
+                        </goals>
+                        <configuration>
+                            <rules>
+                                <requireMavenVersion>
+                                    <version>3.0</version>
+                                </requireMavenVersion>
+                            </rules>    
+                        </configuration>
+                    </execution>
+                </executions>
             </plugin>
         </plugins>
     </build>

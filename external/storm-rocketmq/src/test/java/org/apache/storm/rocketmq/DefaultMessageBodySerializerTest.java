@@ -18,44 +18,19 @@
 
 package org.apache.storm.rocketmq;
 
-import org.apache.rocketmq.common.message.MessageExt;
+import org.junit.Test;
 
-public class ConsumerMessage {
-    private String id;
-    private MessageExt data;
-    private long timestamp;
-    private int retries;
+import static org.junit.Assert.*;
 
-    public ConsumerMessage(String id, MessageExt data) {
-        this.id = id;
-        this.data = data;
+public class DefaultMessageBodySerializerTest {
+    @Test
+    public void serialize() throws Exception {
+        DefaultMessageBodySerializer messageBodySerializer = new DefaultMessageBodySerializer();
+        String body = "this is message body data";
+        assertArrayEquals(body.getBytes(), messageBodySerializer.serialize(body));
+
+        body = null;
+        assertArrayEquals(null, messageBodySerializer.serialize(body));
     }
 
-    public ConsumerMessage(MessageExt data) {
-        this(data.getMsgId(), data);
-    }
-
-    public String getId() {
-        return id;
-    }
-
-    public MessageExt getData() {
-        return data;
-    }
-
-    public long getTimestamp() {
-        return timestamp;
-    }
-
-    public void setTimestamp(long timestamp) {
-        this.timestamp = timestamp;
-    }
-
-    public int getRetries() {
-        return retries;
-    }
-
-    public void setRetries(int retries) {
-        this.retries = retries;
-    }
 }
