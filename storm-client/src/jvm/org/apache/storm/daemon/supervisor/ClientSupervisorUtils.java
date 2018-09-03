@@ -18,21 +18,26 @@
 
 package org.apache.storm.daemon.supervisor;
 
+import com.codahale.metrics.Meter;
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Callable;
-import org.apache.commons.lang.StringUtils;
 import org.apache.storm.Config;
+import org.apache.storm.shade.org.apache.commons.lang.StringUtils;
 import org.apache.storm.utils.ConfigUtils;
 import org.apache.storm.utils.ObjectReader;
+import org.apache.storm.utils.ShellUtils;
 import org.apache.storm.utils.Utils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 public class ClientSupervisorUtils {
+    //Worker launched through external commands, hence we count their exceptions toward shell exceptions
+    public static final Meter numWorkerLaunchExceptions = ShellUtils.numShellExceptions;
+
     private static final Logger LOG = LoggerFactory.getLogger(ClientSupervisorUtils.class);
 
     static boolean doRequiredTopoFilesExist(Map<String, Object> conf, String stormId) throws IOException {
@@ -79,7 +84,7 @@ public class ClientSupervisorUtils {
             throw new IllegalArgumentException("User cannot be blank when calling processLauncher.");
         }
         String wlinitial = (String) (conf.get(Config.SUPERVISOR_WORKER_LAUNCHER));
-        String stormHome = ConfigUtils.concatIfNotNull(System.getProperty("storm.home"));
+        String stormHome = ConfigUtils.concatIfNotNull(System.getProperty(ConfigUtils.STORM_HOME));
         String wl;
         if (StringUtils.isNotBlank(wlinitial)) {
             wl = wlinitial;
@@ -125,7 +130,13 @@ public class ClientSupervisorUtils {
         if (environment != null) {
             procEnv.putAll(environment);
         }
-        final Process process = builder.start();
+        final Process process;
+        try {
+            process = builder.start();
+        } catch (IOException e) {
+            numWorkerLaunchExceptions.mark();
+            throw e;
+        }
         if (logPrefix != null || exitCodeCallback != null) {
             Utils.asyncLoop(new Callable<Long>() {
                 public Long call() {

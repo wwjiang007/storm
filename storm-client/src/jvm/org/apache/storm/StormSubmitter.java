@@ -26,7 +26,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import org.apache.commons.lang.StringUtils;
 import org.apache.storm.dependency.DependencyPropertiesParser;
 import org.apache.storm.dependency.DependencyUploader;
 import org.apache.storm.generated.AlreadyAliveException;
@@ -39,14 +38,15 @@ import org.apache.storm.generated.SubmitOptions;
 import org.apache.storm.generated.TopologyInfo;
 import org.apache.storm.generated.TopologyInitialStatus;
 import org.apache.storm.hooks.SubmitterHookException;
-import org.apache.storm.security.auth.AuthUtils;
+import org.apache.storm.security.auth.ClientAuthUtils;
 import org.apache.storm.security.auth.IAutoCredentials;
+import org.apache.storm.shade.org.apache.commons.lang.StringUtils;
+import org.apache.storm.shade.org.json.simple.JSONValue;
 import org.apache.storm.utils.BufferFileInputStream;
 import org.apache.storm.utils.NimbusClient;
 import org.apache.storm.utils.Utils;
 import org.apache.storm.validation.ConfigValidation;
-import org.apache.thrift.TException;
-import org.json.simple.JSONValue;
+import org.apache.storm.thrift.TException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -58,7 +58,6 @@ public class StormSubmitter {
     public static final Logger LOG = LoggerFactory.getLogger(StormSubmitter.class);
     public static final Pattern zkDigestPattern = Pattern.compile("\\S+:\\S+");
     private static final int THRIFT_CHUNK_SIZE_BYTES = 307200;
-    private static ILocalCluster localNimbus = null;
 
     private static String generateZookeeperDigestSecretPayload() {
         return Utils.secureRandomLong() + ":" + Utils.secureRandomLong();
@@ -91,7 +90,7 @@ public class StormSubmitter {
 
     private static Map<String, String> populateCredentials(Map<String, Object> conf, Map<String, String> creds) {
         Map<String, String> ret = new HashMap<>();
-        for (IAutoCredentials autoCred : AuthUtils.GetAutoCredentials(conf)) {
+        for (IAutoCredentials autoCred : ClientAuthUtils.getAutoCredentials(conf)) {
             LOG.info("Running " + autoCred);
             autoCred.populateCredentials(ret);
         }
@@ -123,14 +122,9 @@ public class StormSubmitter {
             return;
         }
         try {
-            if (localNimbus != null) {
-                LOG.info("Pushing Credentials to topology {} in local mode", name);
-                localNimbus.uploadNewCredentials(name, new Credentials(fullCreds));
-            } else {
-                try (NimbusClient client = NimbusClient.getConfiguredClient(conf)) {
-                    LOG.info("Uploading new credentials to {}", name);
-                    client.getClient().uploadNewCredentials(name, new Credentials(fullCreds));
-                }
+            try (NimbusClient client = NimbusClient.getConfiguredClient(conf)) {
+                LOG.info("Uploading new credentials to {}", name);
+                client.getClient().uploadNewCredentials(name, new Credentials(fullCreds));
             }
             LOG.info("Finished pushing creds to topology: {}", name);
         } catch (TException e) {
@@ -216,52 +210,44 @@ public class StormSubmitter {
             opts.set_creds(new Credentials(fullCreds));
         }
         try {
-            if (localNimbus != null) {
-                LOG.info("Submitting topology " + name + " in local mode");
-                if (opts != null) {
-                    localNimbus.submitTopologyWithOpts(name, topoConf, topology, opts);
-                } else {
-                    // this is for backwards compatibility
-                    localNimbus.submitTopology(name, topoConf, topology);
+            String serConf = JSONValue.toJSONString(topoConf);
+            try (NimbusClient client = NimbusClient.getConfiguredClientAs(conf, asUser)) {
+                if (topologyNameExists(name, client)) {
+                    throw new RuntimeException("Topology with name `" + name + "` already exists on cluster");
                 }
-                LOG.info("Finished submitting topology: " + name);
-            } else {
-                String serConf = JSONValue.toJSONString(topoConf);
-                try (NimbusClient client = NimbusClient.getConfiguredClientAs(conf, asUser)) {
-                    if (topologyNameExists(name, client)) {
-                        throw new RuntimeException("Topology with name `" + name + "` already exists on cluster");
-                    }
+                if (!Utils.isValidKey(name)) {
+                    throw new IllegalArgumentException(name + " does not appear to be a valid topology name.");
+                }
 
-                    // Dependency uploading only makes sense for distributed mode
-                    List<String> jarsBlobKeys = Collections.emptyList();
-                    List<String> artifactsBlobKeys;
+                // Dependency uploading only makes sense for distributed mode
+                List<String> jarsBlobKeys = Collections.emptyList();
+                List<String> artifactsBlobKeys;
 
-                    DependencyUploader uploader = new DependencyUploader();
-                    try {
-                        uploader.init();
+                DependencyUploader uploader = new DependencyUploader();
+                try {
+                    uploader.init();
 
-                        jarsBlobKeys = uploadDependencyJarsToBlobStore(uploader);
+                    jarsBlobKeys = uploadDependencyJarsToBlobStore(uploader);
 
-                        artifactsBlobKeys = uploadDependencyArtifactsToBlobStore(uploader);
-                    } catch (Throwable e) {
-                        // remove uploaded jars blobs, not artifacts since they're shared across the cluster
-                        uploader.deleteBlobs(jarsBlobKeys);
-                        uploader.shutdown();
-                        throw e;
-                    }
+                    artifactsBlobKeys = uploadDependencyArtifactsToBlobStore(uploader);
+                } catch (Throwable e) {
+                    // remove uploaded jars blobs, not artifacts since they're shared across the cluster
+                    uploader.deleteBlobs(jarsBlobKeys);
+                    uploader.shutdown();
+                    throw e;
+                }
 
-                    try {
-                        setDependencyBlobsToTopology(topology, jarsBlobKeys, artifactsBlobKeys);
-                        submitTopologyInDistributeMode(name, topology, opts, progressListener, asUser, conf, serConf, client);
-                    } catch (AlreadyAliveException | InvalidTopologyException | AuthorizationException e) {
-                        // remove uploaded jars blobs, not artifacts since they're shared across the cluster
-                        // Note that we don't handle TException to delete jars blobs
-                        // because it's safer to leave some blobs instead of topology not running
-                        uploader.deleteBlobs(jarsBlobKeys);
-                        throw e;
-                    } finally {
-                        uploader.shutdown();
-                    }
+                try {
+                    setDependencyBlobsToTopology(topology, jarsBlobKeys, artifactsBlobKeys);
+                    submitTopologyInDistributeMode(name, topology, opts, progressListener, asUser, conf, serConf, client);
+                } catch (AlreadyAliveException | InvalidTopologyException | AuthorizationException e) {
+                    // remove uploaded jars blobs, not artifacts since they're shared across the cluster
+                    // Note that we don't handle TException to delete jars blobs
+                    // because it's safer to leave some blobs instead of topology not running
+                    uploader.deleteBlobs(jarsBlobKeys);
+                    throw e;
+                } finally {
+                    uploader.shutdown();
                 }
             }
         } catch (TException e) {

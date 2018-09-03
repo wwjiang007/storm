@@ -19,7 +19,7 @@ import java.util.function.Supplier;
 import org.apache.storm.grouping.Load;
 import org.apache.storm.messaging.netty.BackPressureStatus;
 
-public interface IConnection {
+public interface IConnection extends AutoCloseable {
 
     /**
      * Register a callback to be notified when data is ready to be processed.
@@ -48,14 +48,6 @@ public interface IConnection {
     void sendBackPressureStatus(BackPressureStatus bpStatus);
 
     /**
-     * send a message with taskId and payload
-     *
-     * @param taskId  task ID
-     * @param payload
-     */
-    void send(int taskId, byte[] payload);
-
-    /**
      * send batch messages
      *
      * @param msgs
@@ -81,5 +73,6 @@ public interface IConnection {
     /**
      * close this connection
      */
+    @Override
     void close();
 }

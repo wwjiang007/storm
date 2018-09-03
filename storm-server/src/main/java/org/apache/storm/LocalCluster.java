@@ -95,6 +95,7 @@ import org.apache.storm.testing.InProcessZookeeper;
 import org.apache.storm.testing.NonRichBoltTracker;
 import org.apache.storm.testing.TmpPath;
 import org.apache.storm.testing.TrackedTopology;
+import org.apache.storm.thrift.TException;
 import org.apache.storm.utils.ConfigUtils;
 import org.apache.storm.utils.DRPCClient;
 import org.apache.storm.utils.NimbusClient;
@@ -106,7 +107,6 @@ import org.apache.storm.utils.Time.SimulatedTime;
 import org.apache.storm.utils.Utils;
 import org.apache.storm.utils.WrappedAuthorizationException;
 import org.apache.storm.utils.WrappedKeyNotFoundException;
-import org.apache.thrift.TException;
 import org.json.simple.JSONValue;
 import org.json.simple.parser.ParseException;
 import org.slf4j.Logger;
@@ -135,6 +135,7 @@ public class LocalCluster implements ILocalClusterTrackedTopologyAware, Iface {
     private final List<Supervisor> supervisors;
     private final IStateStorage state;
     private final IStormClusterState clusterState;
+    private final String stormHomeBackup;
     private final List<TmpPath> tmpDirs;
     private final InProcessZookeeper zookeeper;
     private final IContext sharedContext;
@@ -193,6 +194,13 @@ public class LocalCluster implements ILocalClusterTrackedTopologyAware, Iface {
             this.supervisors = new ArrayList<>();
             TmpPath nimbusTmp = new TmpPath();
             this.tmpDirs.add(nimbusTmp);
+            stormHomeBackup = System.getProperty(ConfigUtils.STORM_HOME);
+            TmpPath stormHome = new TmpPath();
+            if (!stormHome.getFile().mkdirs()) {
+                throw new IllegalStateException("Failed to create storm.home directory " + stormHome.getPath());
+            }
+            this.tmpDirs.add(stormHome);
+            System.setProperty(ConfigUtils.STORM_HOME, stormHome.getPath());
             Map<String, Object> conf = ConfigUtils.readStormConfig();
             conf.put(Config.TOPOLOGY_SKIP_MISSING_KRYO_REGISTRATIONS, true);
             conf.put(Config.TOPOLOGY_ENABLE_MESSAGE_TIMEOUTS, false);
@@ -200,6 +208,7 @@ public class LocalCluster implements ILocalClusterTrackedTopologyAware, Iface {
             conf.put(Config.STORM_CLUSTER_MODE, "local");
             conf.put(Config.BLOBSTORE_SUPERUSER, System.getProperty("user.name"));
             conf.put(Config.BLOBSTORE_DIR, nimbusTmp.getPath());
+            conf.put(Config.TOPOLOGY_MIN_REPLICATION_COUNT, 1);
 
             InProcessZookeeper zookeeper = null;
             if (!builder.daemonConf.containsKey(Config.STORM_ZOOKEEPER_SERVERS)) {
@@ -537,6 +546,12 @@ public class LocalCluster implements ILocalClusterTrackedTopologyAware, Iface {
         if (time != null) {
             time.close();
         }
+        
+        if (stormHomeBackup != null) {
+            System.setProperty(ConfigUtils.STORM_HOME, stormHomeBackup);
+        } else {
+            System.clearProperty(ConfigUtils.STORM_HOME);
+        }
     }
 
     /**
@@ -689,6 +704,7 @@ public class LocalCluster implements ILocalClusterTrackedTopologyAware, Iface {
 
     @Override
     public void advanceClusterTime(int secs, int incSecs) throws InterruptedException {
+        waitForIdle();
         for (int amountLeft = secs; amountLeft > 0; amountLeft -= incSecs) {
             int diff = Math.min(incSecs, amountLeft);
             Time.advanceTimeSecs(diff);
@@ -860,11 +876,6 @@ public class LocalCluster implements ILocalClusterTrackedTopologyAware, Iface {
     }
 
     @Override
-    public String beginFileDownload(String file) throws AuthorizationException, TException {
-        throw new WrappedAuthorizationException("FILE DOWNLOAD NOT SUPPORTED IN LOCAL MODE");
-    }
-
-    @Override
     public ByteBuffer downloadChunk(String id) throws AuthorizationException, TException {
         throw new WrappedAuthorizationException("FILE DOWNLOAD NOT SUPPORTED IN LOCAL MODE");
     }
@@ -946,7 +957,7 @@ public class LocalCluster implements ILocalClusterTrackedTopologyAware, Iface {
 
     }
 
-    public void processWorkerMetrics(WorkerMetrics metrics) throws org.apache.thrift.TException {
+    public void processWorkerMetrics(WorkerMetrics metrics) throws TException {
         getNimbus().processWorkerMetrics(metrics);
     }
 

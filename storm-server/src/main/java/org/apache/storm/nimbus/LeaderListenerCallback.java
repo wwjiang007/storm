@@ -12,8 +12,6 @@
 
 package org.apache.storm.nimbus;
 
-import com.google.common.base.Joiner;
-import com.google.common.collect.Sets;
 import java.io.IOException;
 import java.util.HashSet;
 import java.util.List;
@@ -21,9 +19,9 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
 import javax.security.auth.Subject;
+
+import com.codahale.metrics.Meter;
 import org.apache.commons.io.IOUtils;
-import org.apache.curator.framework.CuratorFramework;
-import org.apache.curator.framework.recipes.leader.LeaderLatch;
 import org.apache.storm.Config;
 import org.apache.storm.blobstore.BlobStore;
 import org.apache.storm.blobstore.InputStreamWithMeta;
@@ -33,11 +31,16 @@ import org.apache.storm.daemon.nimbus.TopoCache;
 import org.apache.storm.generated.AuthorizationException;
 import org.apache.storm.generated.KeyNotFoundException;
 import org.apache.storm.generated.StormTopology;
+import org.apache.storm.metric.StormMetricsRegistry;
 import org.apache.storm.security.auth.ReqContext;
+import org.apache.storm.shade.com.google.common.base.Joiner;
+import org.apache.storm.shade.com.google.common.collect.Sets;
+import org.apache.storm.shade.org.apache.curator.framework.CuratorFramework;
+import org.apache.storm.shade.org.apache.curator.framework.recipes.leader.LeaderLatch;
+import org.apache.storm.shade.org.apache.zookeeper.CreateMode;
+import org.apache.storm.shade.org.apache.zookeeper.data.ACL;
 import org.apache.storm.utils.Utils;
 import org.apache.storm.zookeeper.ClientZookeeper;
-import org.apache.zookeeper.CreateMode;
-import org.apache.zookeeper.data.ACL;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -45,6 +48,8 @@ import org.slf4j.LoggerFactory;
  * A callback function when nimbus gains leadership.
  */
 public class LeaderListenerCallback {
+    private static final Meter numGainedLeader = StormMetricsRegistry.registerMeter("nimbus:num-gained-leadership");
+    private static final Meter numLostLeader = StormMetricsRegistry.registerMeter("nimbus:num-lost-leadership");
     private static final Logger LOG = LoggerFactory.getLogger(LeaderListenerCallback.class);
     private static final String STORM_JAR_SUFFIX = "-stormjar.jar";
     private static final String STORM_CODE_SUFFIX = "-stormcode.ser";
@@ -82,6 +87,7 @@ public class LeaderListenerCallback {
      * Invoke when gains leadership.
      */
     public void leaderCallBack() {
+        numGainedLeader.mark();
         //set up nimbus-info to zk
         setUpNimbusInfo(acls);
         //sync zk assignments/id-info to local
@@ -131,6 +137,7 @@ public class LeaderListenerCallback {
      * Invoke when lost leadership.
      */
     public void notLeaderCallback() {
+        numLostLeader.mark();
         tc.clear();
     }
 

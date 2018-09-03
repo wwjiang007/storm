@@ -12,12 +12,13 @@
 
 package org.apache.storm.messaging.netty;
 
+import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
 import javax.security.sasl.Sasl;
-import org.apache.commons.codec.binary.Base64;
-import org.apache.commons.io.Charsets;
 import org.apache.storm.Config;
+import org.apache.storm.shade.com.google.common.base.Charsets;
+import org.apache.storm.shade.org.apache.commons.codec.binary.Base64;
 
 class SaslUtils {
     public static final String KERBEROS = "GSSAPI";
@@ -37,7 +38,7 @@ class SaslUtils {
      * @return password as a char array.
      */
     static char[] encodePassword(byte[] password) {
-        return new String(Base64.encodeBase64(password), Charsets.UTF_8)
+        return new String(Base64.encodeBase64(password), StandardCharsets.UTF_8)
             .toCharArray();
     }
 
@@ -48,7 +49,7 @@ class SaslUtils {
      * @return identifier as a char array.
      */
     static String encodeIdentifier(byte[] identifier) {
-        return new String(Base64.encodeBase64(identifier), Charsets.UTF_8);
+        return new String(Base64.encodeBase64(identifier), StandardCharsets.UTF_8);
     }
 
     static String getSecretKey(Map<String, Object> conf) {

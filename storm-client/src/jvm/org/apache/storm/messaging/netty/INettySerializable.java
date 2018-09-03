@@ -12,11 +12,14 @@
 
 package org.apache.storm.messaging.netty;
 
-import java.io.IOException;
-import org.jboss.netty.buffer.ChannelBuffer;
+import org.apache.storm.shade.io.netty.buffer.ByteBuf;
 
 public interface INettySerializable {
-    ChannelBuffer buffer() throws IOException;
+    /**
+     * Serialize this object to ByteBuf.
+     * @param dest The ByteBuf to serialize to
+     */
+    void write(ByteBuf dest);
 
     int encodeLength();
 }

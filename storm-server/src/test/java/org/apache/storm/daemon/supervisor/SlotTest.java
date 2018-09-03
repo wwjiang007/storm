@@ -50,14 +50,7 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertThat;
 import static org.junit.Assert.assertTrue;
-import static org.mockito.Mockito.any;
-import static org.mockito.Mockito.anyBoolean;
-import static org.mockito.Mockito.anyInt;
-import static org.mockito.Mockito.anyLong;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.*;
 
 public class SlotTest {
     private static final Logger LOG = LoggerFactory.getLogger(SlotTest.class);
@@ -251,7 +244,7 @@ public class SlotTest {
             LSWorkerHeartbeat oldhb = mkWorkerHB(topoId, port, execList, Time.currentTimeSecs() - 10);
             LSWorkerHeartbeat goodhb = mkWorkerHB(topoId, port, execList, Time.currentTimeSecs());
             when(container.readHeartbeat()).thenReturn(oldhb, oldhb, goodhb, goodhb);
-            when(container.areAllProcessesDead()).thenReturn(false, true);
+            when(container.areAllProcessesDead()).thenReturn(false, false, true);
 
             ISupervisor iSuper = mock(ISupervisor.class);
             LocalState state = mock(LocalState.class);
@@ -296,7 +289,7 @@ public class SlotTest {
             Container cContainer = mock(Container.class);
             LSWorkerHeartbeat chb = mkWorkerHB(cTopoId, port, cExecList, Time.currentTimeSecs());
             when(cContainer.readHeartbeat()).thenReturn(chb);
-            when(cContainer.areAllProcessesDead()).thenReturn(false, true);
+            when(cContainer.areAllProcessesDead()).thenReturn(false, false, true);
 
             String nTopoId = "NEW";
             List<ExecutorInfo> nExecList = mkExecutorInfoList(1, 2, 3, 4, 5);
@@ -389,7 +382,7 @@ public class SlotTest {
             Container cContainer = mock(Container.class);
             LSWorkerHeartbeat chb = mkWorkerHB(cTopoId, port, cExecList, Time.currentTimeSecs());
             when(cContainer.readHeartbeat()).thenReturn(chb);
-            when(cContainer.areAllProcessesDead()).thenReturn(false, true);
+            when(cContainer.areAllProcessesDead()).thenReturn(false, false, true);
 
             AsyncLocalizer localizer = mock(AsyncLocalizer.class);
             BlobChangingCallback cb = mock(BlobChangingCallback.class);
@@ -514,7 +507,7 @@ public class SlotTest {
     }
 
     @Test
-    public void testResourcesChanged() throws Exception {
+    public void testResourcesChangedFiltered() throws Exception {
         try (SimulatedTime t = new SimulatedTime(1010)) {
             int port = 8080;
             String cTopoId = "CURRENT";
@@ -522,12 +515,15 @@ public class SlotTest {
             LocalAssignment cAssignment =
                 mkLocalAssignment(cTopoId, cExecList, mkWorkerResources(100.0, 100.0, 100.0));
 
+            String otherTopoId = "OTHER";
+            LocalAssignment otherAssignment = mkLocalAssignment(otherTopoId, cExecList, mkWorkerResources(100.0, 100.0, 100.0));
+
             BlobChangingCallback cb = mock(BlobChangingCallback.class);
 
             Container cContainer = mock(Container.class);
             LSWorkerHeartbeat chb = mkWorkerHB(cTopoId, port, cExecList, Time.currentTimeSecs());
             when(cContainer.readHeartbeat()).thenReturn(chb);
-            when(cContainer.areAllProcessesDead()).thenReturn(false, true);
+            when(cContainer.areAllProcessesDead()).thenReturn(false, false, true);
             AsyncLocalizer localizer = mock(AsyncLocalizer.class);
             Container nContainer = mock(Container.class);
             LocalState state = mock(LocalState.class);
@@ -541,11 +537,17 @@ public class SlotTest {
                                                       containerLauncher, "localhost", port, iSuper, state, cb, null, null);
 
             Set<Slot.BlobChanging> changing = new HashSet<>();
+
             LocallyCachedBlob stormJar = mock(LocallyCachedBlob.class);
             GoodToGo.GoodToGoLatch stormJarLatch = mock(GoodToGo.GoodToGoLatch.class);
             CompletableFuture<Void> stormJarLatchFuture = mock(CompletableFuture.class);
             when(stormJarLatch.countDown()).thenReturn(stormJarLatchFuture);
             changing.add(new Slot.BlobChanging(cAssignment, stormJar, stormJarLatch));
+            Set<Slot.BlobChanging> desired = new HashSet<>(changing);
+
+            LocallyCachedBlob otherJar = mock(LocallyCachedBlob.class);
+            GoodToGo.GoodToGoLatch otherJarLatch = mock(GoodToGo.GoodToGoLatch.class);
+            changing.add(new Slot.BlobChanging(otherAssignment, otherJar, otherJarLatch));
 
             DynamicState dynamicState = new DynamicState(cAssignment, cContainer, cAssignment).withChangingBlobs(changing);
 
@@ -554,9 +556,11 @@ public class SlotTest {
             verify(iSuper).killedWorker(port);
             verify(cContainer).kill();
             verify(localizer, never()).requestDownloadTopologyBlobs(any(), anyInt(), any());
+            verify(stormJarLatch, never()).countDown();
+            verify(otherJarLatch, times(1)).countDown();
             assertNull(nextState.pendingDownload);
             assertNull(nextState.pendingLocalization);
-            assertEquals(changing, nextState.changingBlobs);
+            assertEquals(desired, nextState.changingBlobs);
             assertTrue(nextState.pendingChangingBlobs.isEmpty());
             assertNull(nextState.pendingChangingBlobsAssignment);
             assertThat(Time.currentTimeMillis(), greaterThan(1000L));
@@ -566,7 +570,7 @@ public class SlotTest {
             verify(cContainer).forceKill();
             assertNull(nextState.pendingDownload);
             assertNull(nextState.pendingLocalization);
-            assertEquals(changing, nextState.changingBlobs);
+            assertEquals(desired, nextState.changingBlobs);
             assertTrue(nextState.pendingChangingBlobs.isEmpty());
             assertNull(nextState.pendingChangingBlobsAssignment);
             assertThat(Time.currentTimeMillis(), greaterThan(2000L));

@@ -18,7 +18,6 @@
 
 package org.apache.storm.daemon.supervisor;
 
-import com.google.common.annotations.VisibleForTesting;
 import java.io.File;
 import java.io.IOException;
 import java.net.BindException;
@@ -28,7 +27,6 @@ import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
-import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicReference;
@@ -64,17 +62,19 @@ import org.apache.storm.security.auth.IAuthorizer;
 import org.apache.storm.security.auth.ReqContext;
 import org.apache.storm.security.auth.ThriftConnectionType;
 import org.apache.storm.security.auth.ThriftServer;
+import org.apache.storm.shade.com.google.common.annotations.VisibleForTesting;
+import org.apache.storm.thrift.TException;
+import org.apache.storm.thrift.TProcessor;
 import org.apache.storm.utils.ConfigUtils;
 import org.apache.storm.utils.LocalState;
 import org.apache.storm.utils.ObjectReader;
 import org.apache.storm.utils.ServerConfigUtils;
+import org.apache.storm.utils.ShellUtils;
 import org.apache.storm.utils.Time;
 import org.apache.storm.utils.Utils;
 import org.apache.storm.utils.VersionInfo;
 import org.apache.storm.utils.WrappedAuthorizationException;
 import org.apache.storm.utils.WrappedNotAliveException;
-import org.apache.thrift.TException;
-import org.apache.thrift.TProcessor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -268,7 +268,7 @@ public class Supervisor implements DaemonCommon, AutoCloseable {
      * Launch the supervisor.
      */
     public void launch() throws Exception {
-        LOG.info("Starting Supervisor with conf {}", conf);
+        LOG.info("Starting Supervisor with conf {}", ConfigUtils.maskPasswords(conf));
         String path = ServerConfigUtils.supervisorTmpDir(conf);
         FileUtils.cleanDirectory(new File(path));
 
@@ -310,11 +310,16 @@ public class Supervisor implements DaemonCommon, AutoCloseable {
                 throw new IllegalArgumentException("Cannot start server in local mode!");
             }
             launch();
-            //must invoke after launch cause some services must be initialized
-            launchSupervisorThriftServer(conf);
             Utils.addShutdownHookWithForceKillIn1Sec(this::close);
-            registerWorkerNumGauge("supervisor:num-slots-used-gauge", conf);
+
+            StormMetricsRegistry.registerGauge("supervisor:num-slots-used-gauge", () -> SupervisorUtils.supervisorWorkerIds(conf).size());
+            //This will only get updated once
+            StormMetricsRegistry.registerMeter("supervisor:num-launched").mark();
+            StormMetricsRegistry.registerMeter("supervisor:num-shell-exceptions", ShellUtils.numShellExceptions);
             StormMetricsRegistry.startMetricsReporters(conf);
+
+            // blocking call under the hood, must invoke after launch cause some services must be initialized
+            launchSupervisorThriftServer(conf);
         } catch (Exception e) {
             LOG.error("Failed to start supervisor\n", e);
             System.exit(1);
@@ -441,16 +446,6 @@ public class Supervisor implements DaemonCommon, AutoCloseable {
         eventManager.add(syn);
     }
 
-    private void registerWorkerNumGauge(String name, final Map<String, Object> conf) {
-        StormMetricsRegistry.registerGauge(name, new Callable<Integer>() {
-            @Override
-            public Integer call() throws Exception {
-                Collection<String> pids = SupervisorUtils.supervisorWorkerIds(conf);
-                return pids.size();
-            }
-        });
-    }
-
     @Override
     public void close() {
         try {
@@ -496,15 +491,14 @@ public class Supervisor implements DaemonCommon, AutoCloseable {
         }
         for (Killable k : containers) {
             try {
-                k.forceKill();
                 long start = Time.currentTimeMillis();
                 while (!k.areAllProcessesDead()) {
                     if ((Time.currentTimeMillis() - start) > 10_000) {
                         throw new RuntimeException("Giving up on killing " + k
                                                    + " after " + (Time.currentTimeMillis() - start) + " ms");
                     }
-                    Time.sleep(100);
                     k.forceKill();
+                    Time.sleep(100);
                 }
                 k.cleanUp();
             } catch (Exception e) {

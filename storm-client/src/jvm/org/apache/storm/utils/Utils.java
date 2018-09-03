@@ -18,11 +18,6 @@
 
 package org.apache.storm.utils;
 
-import com.google.common.annotations.VisibleForTesting;
-import com.google.common.collect.Lists;
-import com.google.common.collect.MapDifference;
-import com.google.common.collect.MapDifference.ValueDifference;
-import com.google.common.collect.Maps;
 import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -70,8 +65,6 @@ import java.util.zip.GZIPOutputStream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 import javax.security.auth.Subject;
-import org.apache.commons.io.FileUtils;
-import org.apache.commons.io.input.ClassLoaderObjectInputStream;
 import org.apache.storm.Config;
 import org.apache.storm.blobstore.BlobStore;
 import org.apache.storm.blobstore.ClientBlobStore;
@@ -88,21 +81,28 @@ import org.apache.storm.generated.StormTopology;
 import org.apache.storm.generated.TopologyInfo;
 import org.apache.storm.generated.TopologySummary;
 import org.apache.storm.security.auth.ReqContext;
-import org.apache.storm.serialization.DefaultSerializationDelegate;
+import org.apache.storm.serialization.GzipThriftSerializationDelegate;
 import org.apache.storm.serialization.SerializationDelegate;
-import org.apache.thrift.TBase;
-import org.apache.thrift.TDeserializer;
-import org.apache.thrift.TException;
-import org.apache.thrift.TSerializer;
-import org.apache.zookeeper.ZooDefs;
-import org.apache.zookeeper.data.ACL;
-import org.apache.zookeeper.data.Id;
-import org.json.simple.JSONValue;
-import org.json.simple.parser.ParseException;
+import org.apache.storm.shade.com.google.common.annotations.VisibleForTesting;
+import org.apache.storm.shade.com.google.common.collect.Lists;
+import org.apache.storm.shade.com.google.common.collect.MapDifference;
+import org.apache.storm.shade.com.google.common.collect.Maps;
+import org.apache.storm.shade.org.apache.commons.io.FileUtils;
+import org.apache.storm.shade.org.apache.commons.io.input.ClassLoaderObjectInputStream;
+import org.apache.storm.shade.org.apache.commons.lang.StringUtils;
+import org.apache.storm.shade.org.apache.zookeeper.ZooDefs;
+import org.apache.storm.shade.org.apache.zookeeper.data.ACL;
+import org.apache.storm.shade.org.apache.zookeeper.data.Id;
+import org.apache.storm.shade.org.json.simple.JSONValue;
+import org.apache.storm.shade.org.json.simple.parser.ParseException;
+import org.apache.storm.shade.org.yaml.snakeyaml.Yaml;
+import org.apache.storm.shade.org.yaml.snakeyaml.constructor.SafeConstructor;
+import org.apache.storm.thrift.TBase;
+import org.apache.storm.thrift.TDeserializer;
+import org.apache.storm.thrift.TException;
+import org.apache.storm.thrift.TSerializer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.yaml.snakeyaml.Yaml;
-import org.yaml.snakeyaml.constructor.SafeConstructor;
 
 public class Utils {
     public static final Logger LOG = LoggerFactory.getLogger(Utils.class);
@@ -118,6 +118,7 @@ public class Utils {
     // tests by subclassing.
     private static Utils _instance = new Utils();
     private static String memoizedLocalHostnameString = null;
+    public static final Pattern TOPOLOGY_KEY_PATTERN = Pattern.compile("^[\\w \\t\\._-]+$", Pattern.UNICODE_CHARACTER_CLASS);
 
     static {
         localConf = readStormConfig();
@@ -346,6 +347,9 @@ public class Utils {
                 try {
                     final Callable<Long> fn = isFactory ? (Callable<Long>) afn.call() : afn;
                     while (true) {
+                        if (Thread.interrupted()) {
+                            throw new InterruptedException();
+                        }
                         final Long s = fn.call();
                         if (s == null) { // then stop running it
                             break;
@@ -487,6 +491,10 @@ public class Utils {
     }
 
     public static <T> T javaDeserialize(byte[] serialized, Class<T> clazz) {
+        if ("true".equalsIgnoreCase(System.getProperty("java.deserialization.disabled"))) {
+            throw new AssertionError("java deserialization has been disabled and is only safe from within a worker process");
+        }
+
         try {
             ByteArrayInputStream bis = new ByteArrayInputStream(serialized);
             ObjectInputStream ois = null;
@@ -779,8 +787,7 @@ public class Utils {
             Class delegateClass = Class.forName(delegateClassName);
             delegate = (SerializationDelegate) delegateClass.newInstance();
         } catch (ClassNotFoundException | InstantiationException | IllegalAccessException e) {
-            LOG.error("Failed to construct serialization delegate, falling back to default", e);
-            delegate = new DefaultSerializationDelegate();
+            throw new RuntimeException("Failed to construct serialization delegate class " + delegateClassName, e);
         }
         delegate.prepare(topoConf);
         return delegate;
@@ -1076,7 +1083,7 @@ public class Utils {
                      + "serialization. Name: {} - Value: {}",
                      entryOnRight.getKey(), entryOnRight.getKey(), entryOnRight.getValue());
         }
-        for (Map.Entry<String, ValueDifference<Object>> entryDiffers : diff.entriesDiffering().entrySet()) {
+        for (Map.Entry<String, MapDifference.ValueDifference<Object>> entryDiffers : diff.entriesDiffering().entrySet()) {
             Object leftValue = entryDiffers.getValue().leftValue();
             Object rightValue = entryDiffers.getValue().rightValue();
             LOG.warn("Config value differs after json serialization. Name: {} - Original Value: {} - DeSer. Value: {}",
@@ -1184,6 +1191,10 @@ public class Utils {
         final java.lang.management.ThreadMXBean threadMXBean = ManagementFactory.getThreadMXBean();
         final java.lang.management.ThreadInfo[] threadInfos = threadMXBean.getThreadInfo(threadMXBean.getAllThreadIds(), 100);
         for (java.lang.management.ThreadInfo threadInfo : threadInfos) {
+            if (threadInfo == null) {
+                //Thread died before we could get the info, skip
+                continue;
+            }
             dump.append('"');
             dump.append(threadInfo.getThreadName());
             dump.append("\" ");
@@ -1636,6 +1647,20 @@ public class Utils {
             return memoizedLocalHostname();
         }
         return (String) hostnameString;
+    }
+
+    /**
+     * Validates topology name / blob key.
+     *
+     * @param key topology name / Key for the blob.
+     */
+    public static boolean isValidKey(String key) {
+        if (StringUtils.isEmpty(key) || "..".equals(key) || ".".equals(key) || !TOPOLOGY_KEY_PATTERN.matcher(key).matches()) {
+            LOG.error("'{}' does not appear to be valid. It must match {}. And it can't be \".\", \"..\", null or empty string.", key,
+                    TOPOLOGY_KEY_PATTERN);
+            return false;
+        }
+        return true;
     }
 
     /**

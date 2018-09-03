@@ -43,6 +43,7 @@ import org.apache.storm.testing.MockedSources;
 import org.apache.storm.testing.TestJob;
 import org.apache.storm.testing.TrackedTopology;
 import org.apache.storm.testing.TupleCaptureBolt;
+import org.apache.storm.thrift.TException;
 import org.apache.storm.tuple.Fields;
 import org.apache.storm.tuple.Tuple;
 import org.apache.storm.tuple.TupleImpl;
@@ -51,7 +52,6 @@ import org.apache.storm.utils.RegisteredGlobalState;
 import org.apache.storm.utils.Time;
 import org.apache.storm.utils.Time.SimulatedTime;
 import org.apache.storm.utils.Utils;
-import org.apache.thrift.TException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -82,7 +82,7 @@ public class Testing {
      * passed
      * @param condition what we are waiting for
      * @param body what to run in the loop
-     * @throws AssertionError if teh loop timed out.
+     * @throws AssertionError if the loop timed out.
      */
     public static void whileTimeout(Condition condition, Runnable body) {
         whileTimeout(TEST_TIMEOUT_MS, condition, body);
@@ -94,7 +94,7 @@ public class Testing {
      * @param timeoutMs the number of ms to wait before timing out.
      * @param condition what we are waiting for
      * @param body what to run in the loop
-     * @throws AssertionError if teh loop timed out.
+     * @throws AssertionError if the loop timed out.
      */
     public static void whileTimeout(long timeoutMs, Condition condition, Runnable body) {
         long endTime = System.currentTimeMillis() + timeoutMs;

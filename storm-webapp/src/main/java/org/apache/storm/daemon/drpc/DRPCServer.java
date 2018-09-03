@@ -29,15 +29,15 @@ import org.apache.storm.Config;
 import org.apache.storm.DaemonConfig;
 import org.apache.storm.daemon.drpc.webapp.DRPCApplication;
 import org.apache.storm.daemon.drpc.webapp.ReqContextFilter;
+import org.apache.storm.daemon.ui.FilterConfiguration;
+import org.apache.storm.daemon.ui.UIHelpers;
 import org.apache.storm.generated.DistributedRPC;
 import org.apache.storm.generated.DistributedRPCInvocations;
 import org.apache.storm.metric.StormMetricsRegistry;
-import org.apache.storm.security.auth.AuthUtils;
 import org.apache.storm.security.auth.IHttpCredentialsPlugin;
+import org.apache.storm.security.auth.ServerAuthUtils;
 import org.apache.storm.security.auth.ThriftConnectionType;
 import org.apache.storm.security.auth.ThriftServer;
-import org.apache.storm.ui.FilterConfiguration;
-import org.apache.storm.ui.UIHelpers;
 import org.apache.storm.utils.ObjectReader;
 import org.apache.storm.utils.Utils;
 import org.eclipse.jetty.server.Server;
@@ -62,7 +62,7 @@ public class DRPCServer implements AutoCloseable {
      * @param conf Conf to be added in context filter
      */
     public static void addRequestContextFilter(ServletContextHandler context, String configName, Map<String, Object> conf) {
-        IHttpCredentialsPlugin auth = AuthUtils.GetHttpCredentialsPlugin(conf, (String)conf.get(configName));
+        IHttpCredentialsPlugin auth = ServerAuthUtils.getHttpCredentialsPlugin(conf, (String)conf.get(configName));
         ReqContextFilter filter = new ReqContextFilter(auth);
         context.addFilter(new FilterHolder(filter), "/*", EnumSet.allOf(DispatcherType.class));
     }
@@ -118,7 +118,7 @@ public class DRPCServer implements AutoCloseable {
             jerseyServlet.setInitParameter("javax.ws.rs.Application", DRPCApplication.class.getName());
             
             UIHelpers.configFilters(context, filterConfigurations);
-            addRequestContextFilter(context, Config.DRPC_HTTP_CREDS_PLUGIN, conf);
+            addRequestContextFilter(context, DaemonConfig.DRPC_HTTP_CREDS_PLUGIN, conf);
         }
         return ret;
     }
@@ -145,8 +145,7 @@ public class DRPCServer implements AutoCloseable {
     @VisibleForTesting
     void start() throws Exception {
         LOG.info("Starting Distributed RPC servers...");
-        new Thread(() -> invokeServer.serve()).start();
-        
+        new Thread(invokeServer::serve).start();
         if (httpServer != null) {
             httpServer.start();
         }
@@ -189,22 +188,25 @@ public class DRPCServer implements AutoCloseable {
             closed = true;
         }
     }
-    
+
     /**
+     * The port the DRPC handler server is listening on.
      * @return The port the DRPC handler server is listening on.
      */
     public int getDrpcPort() {
         return handlerServer.getPort();
     }
-    
+
     /**
+     * The port the DRPC invoke server is listening on.
      * @return The port the DRPC invoke server is listening on.
      */
     public int getDrpcInvokePort() {
         return invokeServer.getPort();
     }
-    
+
     /**
+     * The port the HTTP server is listening on. Not available until {@link #start() } has run.
      * @return The port the HTTP server is listening on. Not available until {@link #start() } has run.
      */
     public int getHttpServerPort() {
@@ -220,7 +222,7 @@ public class DRPCServer implements AutoCloseable {
         Utils.setupDefaultUncaughtExceptionHandler();
         Map<String, Object> conf = Utils.readStormConfig();
         try (DRPCServer server = new DRPCServer(conf)) {
-            Utils.addShutdownHookWithForceKillIn1Sec(() -> server.close());
+            Utils.addShutdownHookWithForceKillIn1Sec(server::close);
             StormMetricsRegistry.startMetricsReporters(conf);
             server.start();
             server.awaitTermination();

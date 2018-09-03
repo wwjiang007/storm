@@ -18,8 +18,6 @@
 
 package org.apache.storm.daemon.supervisor;
 
-import com.google.common.base.Joiner;
-import com.google.common.collect.Lists;
 import java.io.File;
 import java.io.FilenameFilter;
 import java.io.IOException;
@@ -43,6 +41,8 @@ import org.apache.storm.generated.ProfileAction;
 import org.apache.storm.generated.ProfileRequest;
 import org.apache.storm.generated.StormTopology;
 import org.apache.storm.generated.WorkerResources;
+import org.apache.storm.shade.com.google.common.base.Joiner;
+import org.apache.storm.shade.com.google.common.collect.Lists;
 import org.apache.storm.utils.ConfigUtils;
 import org.apache.storm.utils.LocalState;
 import org.apache.storm.utils.ObjectReader;
@@ -69,7 +69,7 @@ public class BasicContainer extends Container {
         Joiner.on(File.pathSeparator).skipNulls();
     protected final LocalState _localState;
     protected final String _profileCmd;
-    protected final String _stormHome = System.getProperty("storm.home");
+    protected final String _stormHome = System.getProperty(ConfigUtils.STORM_HOME);
     protected final double hardMemoryLimitMultiplier;
     protected final long hardMemoryLimitOver;
     protected final long lowMemoryThresholdMB;

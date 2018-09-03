@@ -361,7 +361,7 @@ def jar(jarfile, klass, *args):
     And when you want to ship maven artifacts and its transitive dependencies, you can pass them to --artifacts with comma-separated string.
     You can also exclude some dependencies like what you're doing in maven pom.
     Please add exclusion artifacts with '^' separated string after the artifact.
-    For example, --artifacts "redis.clients:jedis:2.9.0,org.apache.kafka:kafka_2.10:0.8.2.2^org.slf4j:slf4j-log4j12" will load jedis and kafka artifact and all of transitive dependencies but exclude slf4j-log4j12 from kafka.
+    For example, -artifacts "redis.clients:jedis:2.9.0,org.apache.kafka:kafka-clients:1.0.0^org.slf4j:slf4j-api" will load jedis and kafka-clients artifact and all of transitive dependencies but exclude slf4j-api from kafka.
 
     When you need to pull the artifacts from other than Maven Central, you can pass remote repositories to --artifactRepositories option with comma-separated string.
     Repository format is "<name>^<url>". '^' is taken as separator because URL allows various characters.
@@ -373,7 +373,7 @@ def jar(jarfile, klass, *args):
     --proxyUsername: username of proxy if it requires basic auth
     --proxyPassword: password of proxy if it requires basic auth
 
-    Complete example of options is here: `./bin/storm jar example/storm-starter/storm-starter-topologies-*.jar org.apache.storm.starter.RollingTopWords blobstore-remote2 remote --jars "./external/storm-redis/storm-redis-1.1.0.jar,./external/storm-kafka/storm-kafka-1.1.0.jar" --artifacts "redis.clients:jedis:2.9.0,org.apache.kafka:kafka_2.10:0.8.2.2^org.slf4j:slf4j-log4j12" --artifactRepositories "jboss-repository^http://repository.jboss.com/maven2,HDPRepo^http://repo.hortonworks.com/content/groups/public/"`
+    Complete example of options is here: `./bin/storm jar example/storm-starter/storm-starter-topologies-*.jar org.apache.storm.starter.RollingTopWords blobstore-remote2 remote --jars "./external/storm-redis/storm-redis-1.1.0.jar,./external/storm-kafka-client/storm-kafka-client-1.1.0.jar" --artifacts "redis.clients:jedis:2.9.0,org.apache.kafka:kafka-clients:1.0.0^org.slf4j:slf4j-api" --artifactRepositories "jboss-repository^http://repository.jboss.com/maven2,HDPRepo^http://repo.hortonworks.com/content/groups/public/"`
 
     When you pass jars and/or artifacts options, StormSubmitter will upload them when the topology is submitted, and they will be included to classpath of both the process which runs the class, and also workers for that topology.
 
@@ -640,15 +640,31 @@ def kill_workers(*args):
         extrajars=[USER_CONF_DIR, os.path.join(STORM_DIR, "bin")])
 
 def admin(*args):
-    """Syntax: [storm admin cmd]
+    """Syntax: [storm admin cmd [options]]
 
-    This is a proxy of nimbus and allow to execute admin commands. As of now it supports
-    command to remove corrupt topologies.
-    Nimbus doesn't clean up corrupted topologies automatically. This command should clean
-    up corrupt topologies i.e.topologies whose codes are not available on blobstore.
-    In future this command would support more admin commands.
-    Supported command
-    storm admin remove_corrupt_topologies
+    The storm admin command provides access to several operations that can help
+    an administrator debug or fix a cluster.
+
+    remove_corrupt_topologies - This command should be run on a nimbus node as
+    the same user nimbus runs as.  It will go directly to zookeeper + blobstore
+    and find topologies that appear to be corrupted because of missing blobs.
+    It will kill those topologies.
+
+    zk_cli [options] - This command will launch a zookeeper cli pointing to the
+    storm zookeeper instance logged in as the nimbus user.  It should be run on
+    a nimbus server as the user nimbus runs as.
+        -s --server <connection string>: Set the connection string to use,
+            defaults to storm connection string.
+        -t --time-out <timeout>:  Set the timeout to use, defaults to storm
+            zookeeper timeout.
+        -w --write: Allow for writes, defaults to read only, we don't want to
+            cause problems.
+        -n --no-root: Don't include the storm root on the default connection string.
+        -j --jaas <jaas_file>: Include a jaas file that should be used when
+            authenticating with ZK defaults to the
+            java.security.auth.login.config conf.
+
+    creds topology_id - Print the credential keys for a topology.
     """
     exec_storm_class(
         "org.apache.storm.command.AdminCommands",
@@ -704,6 +720,7 @@ def nimbus(klass="org.apache.storm.daemon.nimbus.Nimbus"):
     """
     cppaths = [CLUSTER_CONF_DIR]
     jvmopts = parse_args(confvalue("nimbus.childopts", cppaths)) + [
+        "-Djava.deserialization.disabled=true",
         "-Dlogfile.name=nimbus.log",
         "-Dlog4j.configurationFile=" + os.path.join(get_log4j2_conf_dir(), "cluster.xml"),
     ]
@@ -725,6 +742,7 @@ def pacemaker(klass="org.apache.storm.pacemaker.Pacemaker"):
     """
     cppaths = [CLUSTER_CONF_DIR]
     jvmopts = parse_args(confvalue("pacemaker.childopts", cppaths)) + [
+        "-Djava.deserialization.disabled=true",
         "-Dlogfile.name=pacemaker.log",
         "-Dlog4j.configurationFile=" + os.path.join(get_log4j2_conf_dir(), "cluster.xml"),
     ]
@@ -746,6 +764,7 @@ def supervisor(klass="org.apache.storm.daemon.supervisor.Supervisor"):
     """
     cppaths = [CLUSTER_CONF_DIR]
     jvmopts = parse_args(confvalue("supervisor.childopts", cppaths)) + [
+        "-Djava.deserialization.disabled=true",
         "-Dlogfile.name=" + STORM_SUPERVISOR_LOG_FILE,
         "-Dlog4j.configurationFile=" + os.path.join(get_log4j2_conf_dir(), "cluster.xml"),
     ]
@@ -768,15 +787,19 @@ def ui():
     """
     cppaths = [CLUSTER_CONF_DIR]
     jvmopts = parse_args(confvalue("ui.childopts", cppaths)) + [
+        "-Djava.deserialization.disabled=true",
         "-Dlogfile.name=ui.log",
         "-Dlog4j.configurationFile=" + os.path.join(get_log4j2_conf_dir(), "cluster.xml")
     ]
+
+    allextrajars = get_wildcard_dir(STORM_WEBAPP_LIB_DIR)
+    allextrajars.append(CLUSTER_CONF_DIR)
     exec_storm_class(
-        "org.apache.storm.ui.core",
+        "org.apache.storm.daemon.ui.UIServer",
         jvmtype="-server",
         daemonName="ui",
         jvmopts=jvmopts,
-        extrajars=[STORM_DIR, CLUSTER_CONF_DIR])
+        extrajars=allextrajars)
 
 def logviewer():
     """Syntax: [storm logviewer]
@@ -790,6 +813,7 @@ def logviewer():
     """
     cppaths = [CLUSTER_CONF_DIR]
     jvmopts = parse_args(confvalue("logviewer.childopts", cppaths)) + [
+        "-Djava.deserialization.disabled=true",
         "-Dlogfile.name=logviewer.log",
         "-Dlog4j.configurationFile=" + os.path.join(get_log4j2_conf_dir(), "cluster.xml")
     ]
@@ -834,6 +858,7 @@ def drpc():
     """
     cppaths = [CLUSTER_CONF_DIR]
     jvmopts = parse_args(confvalue("drpc.childopts", cppaths)) + [
+        "-Djava.deserialization.disabled=true",
         "-Dlogfile.name=drpc.log",
         "-Dlog4j.configurationFile=" + os.path.join(get_log4j2_conf_dir(), "cluster.xml")
     ]
@@ -853,10 +878,16 @@ def dev_zookeeper():
     "storm.zookeeper.port" as its port. This is only intended for development/testing, the
     Zookeeper instance launched is not configured to be used in production.
     """
+    jvmopts = [
+        "-Dlogfile.name=dev-zookeeper.log",
+        "-Dlog4j.configurationFile=" + os.path.join(get_log4j2_conf_dir(), "cluster.xml")
+    ]
     cppaths = [CLUSTER_CONF_DIR]
     exec_storm_class(
         "org.apache.storm.command.DevZookeeper",
         jvmtype="-server",
+        daemonName="dev_zookeeper",
+        jvmopts=jvmopts,
         extrajars=[CLUSTER_CONF_DIR])
 
 def version():

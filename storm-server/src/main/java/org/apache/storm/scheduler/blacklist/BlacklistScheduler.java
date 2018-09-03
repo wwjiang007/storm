@@ -12,14 +12,11 @@
 
 package org.apache.storm.scheduler.blacklist;
 
-import com.google.common.collect.EvictingQueue;
-import com.google.common.collect.Sets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.Callable;
 import org.apache.storm.DaemonConfig;
 import org.apache.storm.metric.StormMetricsRegistry;
 import org.apache.storm.scheduler.Cluster;
@@ -31,6 +28,8 @@ import org.apache.storm.scheduler.blacklist.reporters.IReporter;
 import org.apache.storm.scheduler.blacklist.reporters.LogReporter;
 import org.apache.storm.scheduler.blacklist.strategies.DefaultBlacklistStrategy;
 import org.apache.storm.scheduler.blacklist.strategies.IBlacklistStrategy;
+import org.apache.storm.shade.com.google.common.collect.EvictingQueue;
+import org.apache.storm.shade.com.google.common.collect.Sets;
 import org.apache.storm.utils.ObjectReader;
 import org.apache.storm.utils.ReflectionUtils;
 import org.slf4j.Logger;
@@ -89,13 +88,8 @@ public class BlacklistScheduler implements IScheduler {
         cachedSupervisors = new HashMap<>();
         blacklistHost = new HashSet<>();
 
-        StormMetricsRegistry.registerGauge("nimbus:num-blacklisted-supervisor", new Callable<Integer>() {
-            @Override
-            public Integer call() throws Exception {
-                //nimbus:num-blacklisted-supervisor + none blacklisted supervisor = nimbus:num-supervisors
-                return blacklistHost.size();
-            }
-        });
+        //nimbus:num-blacklisted-supervisor + non-blacklisted supervisor = nimbus:num-supervisors
+        StormMetricsRegistry.registerGauge("nimbus:num-blacklisted-supervisor", () -> blacklistHost.size());
     }
 
     @Override

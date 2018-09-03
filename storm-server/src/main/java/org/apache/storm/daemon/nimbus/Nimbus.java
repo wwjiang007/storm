@@ -18,12 +18,9 @@
 
 package org.apache.storm.daemon.nimbus;
 
-import com.codahale.metrics.ExponentiallyDecayingReservoir;
 import com.codahale.metrics.Histogram;
 import com.codahale.metrics.Meter;
-import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Strings;
-import com.google.common.collect.ImmutableMap;
+import com.codahale.metrics.Timer;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -40,6 +37,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -48,6 +46,7 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.NavigableMap;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -56,7 +55,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import javax.security.auth.Subject;
-import org.apache.curator.framework.CuratorFramework;
+
 import org.apache.storm.Config;
 import org.apache.storm.Constants;
 import org.apache.storm.DaemonConfig;
@@ -91,6 +90,7 @@ import org.apache.storm.generated.ExecutorInfo;
 import org.apache.storm.generated.ExecutorStats;
 import org.apache.storm.generated.ExecutorSummary;
 import org.apache.storm.generated.GetInfoOptions;
+import org.apache.storm.generated.IllegalStateException;
 import org.apache.storm.generated.InvalidTopologyException;
 import org.apache.storm.generated.KeyAlreadyExistsException;
 import org.apache.storm.generated.KeyNotFoundException;
@@ -171,7 +171,7 @@ import org.apache.storm.scheduler.resource.ResourceAwareScheduler;
 import org.apache.storm.scheduler.resource.ResourceUtils;
 import org.apache.storm.scheduler.resource.normalization.NormalizedResourceRequest;
 import org.apache.storm.security.INimbusCredentialPlugin;
-import org.apache.storm.security.auth.AuthUtils;
+import org.apache.storm.security.auth.ClientAuthUtils;
 import org.apache.storm.security.auth.IAuthorizer;
 import org.apache.storm.security.auth.ICredentialsRenewer;
 import org.apache.storm.security.auth.IGroupMappingServiceProvider;
@@ -181,12 +181,22 @@ import org.apache.storm.security.auth.ReqContext;
 import org.apache.storm.security.auth.ThriftConnectionType;
 import org.apache.storm.security.auth.ThriftServer;
 import org.apache.storm.security.auth.workertoken.WorkerTokenManager;
+import org.apache.storm.shade.com.google.common.annotations.VisibleForTesting;
+import org.apache.storm.shade.com.google.common.base.Strings;
+import org.apache.storm.shade.com.google.common.collect.ImmutableMap;
+import org.apache.storm.shade.com.google.common.collect.MapDifference;
+import org.apache.storm.shade.com.google.common.collect.Maps;
+import org.apache.storm.shade.org.apache.curator.framework.CuratorFramework;
+import org.apache.storm.shade.org.apache.zookeeper.ZooDefs;
+import org.apache.storm.shade.org.apache.zookeeper.data.ACL;
 import org.apache.storm.stats.StatsUtil;
+import org.apache.storm.thrift.TException;
 import org.apache.storm.utils.BufferInputStream;
 import org.apache.storm.utils.ConfigUtils;
 import org.apache.storm.utils.LocalState;
 import org.apache.storm.utils.ObjectReader;
 import org.apache.storm.utils.ReflectionUtils;
+import org.apache.storm.utils.RotatingMap;
 import org.apache.storm.utils.ServerConfigUtils;
 import org.apache.storm.utils.ServerUtils;
 import org.apache.storm.utils.SimpleVersion;
@@ -198,23 +208,20 @@ import org.apache.storm.utils.Utils.UptimeComputer;
 import org.apache.storm.utils.VersionInfo;
 import org.apache.storm.utils.WrappedAlreadyAliveException;
 import org.apache.storm.utils.WrappedAuthorizationException;
+import org.apache.storm.utils.WrappedIllegalStateException;
 import org.apache.storm.utils.WrappedInvalidTopologyException;
 import org.apache.storm.utils.WrappedNotAliveException;
 import org.apache.storm.validation.ConfigValidation;
 import org.apache.storm.zookeeper.AclEnforcement;
 import org.apache.storm.zookeeper.ClientZookeeper;
 import org.apache.storm.zookeeper.Zookeeper;
-import org.apache.thrift.TException;
-import org.apache.zookeeper.ZooDefs;
-import org.apache.zookeeper.data.ACL;
 import org.json.simple.JSONValue;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 public class Nimbus implements Iface, Shutdownable, DaemonCommon {
     @VisibleForTesting
-    public static final List<ACL> ZK_ACLS = Arrays.asList(ZooDefs.Ids.CREATOR_ALL_ACL.get(0),
-                                                          new ACL(ZooDefs.Perms.READ | ZooDefs.Perms.CREATE, ZooDefs.Ids.ANYONE_ID_UNSAFE));
+    public static final List<ACL> ZK_ACLS = Arrays.asList(ZooDefs.Ids.CREATOR_ALL_ACL.get(0));
     public static final SimpleVersion MIN_VERSION_SUPPORT_RPC_HEARTBEAT = new SimpleVersion("2.0.0");
     private static final Logger LOG = LoggerFactory.getLogger(Nimbus.class);
     //    Metrics
@@ -234,7 +241,6 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
     private static final Meter beginFileUploadCalls = StormMetricsRegistry.registerMeter("nimbus:num-beginFileUpload-calls");
     private static final Meter uploadChunkCalls = StormMetricsRegistry.registerMeter("nimbus:num-uploadChunk-calls");
     private static final Meter finishFileUploadCalls = StormMetricsRegistry.registerMeter("nimbus:num-finishFileUpload-calls");
-    private static final Meter beginFileDownloadCalls = StormMetricsRegistry.registerMeter("nimbus:num-beginFileDownload-calls");
     private static final Meter downloadChunkCalls = StormMetricsRegistry.registerMeter("nimbus:num-downloadChunk-calls");
     private static final Meter getNimbusConfCalls = StormMetricsRegistry.registerMeter("nimbus:num-getNimbusConf-calls");
     private static final Meter getLogConfigCalls = StormMetricsRegistry.registerMeter("nimbus:num-getLogConfig-calls");
@@ -250,10 +256,18 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
     private static final Meter getTopologyPageInfoCalls = StormMetricsRegistry.registerMeter("nimbus:num-getTopologyPageInfo-calls");
     private static final Meter getSupervisorPageInfoCalls = StormMetricsRegistry.registerMeter("nimbus:num-getSupervisorPageInfo-calls");
     private static final Meter getComponentPageInfoCalls = StormMetricsRegistry.registerMeter("nimbus:num-getComponentPageInfo-calls");
-    private static final Histogram scheduleTopologyTimeMs = StormMetricsRegistry.registerHistogram("nimbus:time-scheduleTopology-ms",
-                                                                                                   new ExponentiallyDecayingReservoir());
     private static final Meter getOwnerResourceSummariesCalls = StormMetricsRegistry.registerMeter(
         "nimbus:num-getOwnerResourceSummaries-calls");
+    //Timer
+    private static final Timer fileUploadDuration = StormMetricsRegistry.registerTimer("nimbus:files-upload-duration-ms");
+    private static final Timer schedulingDuration = StormMetricsRegistry.registerTimer("nimbus:topology-scheduling-duration-ms");
+    //Scheduler histogram
+    private static final Histogram numAddedExecPerScheduling = StormMetricsRegistry.registerHistogram("nimbus:num-added-executors-per-scheduling");
+    private static final Histogram numAddedSlotPerScheduling = StormMetricsRegistry.registerHistogram("nimbus:num-added-slots-per-scheduling");
+    private static final Histogram numRemovedExecPerScheduling = StormMetricsRegistry.registerHistogram("nimbus:num-removed-executors-per-scheduling");
+    private static final Histogram numRemovedSlotPerScheduling = StormMetricsRegistry.registerHistogram("nimbus:num-removed-slots-per-scheduling");
+    private static final Histogram numNetExecIncreasePerScheduling = StormMetricsRegistry.registerHistogram("nimbus:num-net-executors-increase-per-scheduling");
+    private static final Histogram numNetSlotIncreasePerScheduling = StormMetricsRegistry.registerHistogram("nimbus:num-net-slots-increase-per-scheduling");
     // END Metrics
     private static final Meter shutdownCalls = StormMetricsRegistry.registerMeter("nimbus:num-shutdown-calls");
     private static final Meter processWorkerMetricsCalls = StormMetricsRegistry.registerMeter("nimbus:process-worker-metric-calls");
@@ -283,8 +297,8 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
         Assignment oldAssignment = state.assignmentInfo(topoId, null);
         state.removeStorm(topoId);
         notifySupervisorsAsKilled(state, oldAssignment, nimbus.getAssignmentsDistributer());
-        BlobStore store = nimbus.getBlobStore();
         nimbus.getHeartbeatsCache().getAndUpdate(new Dissoc<>(topoId));
+        nimbus.getIdToExecutors().getAndUpdate(new Dissoc<>(topoId));
         return null;
     };
     private static final TopologyStateTransition DO_REBALANCE_TRANSITION = (args, nimbus, topoId, base) -> {
@@ -375,6 +389,8 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
     private static final List<String> EMPTY_STRING_LIST = Collections.unmodifiableList(Collections.emptyList());
     private static final Set<String> EMPTY_STRING_SET = Collections.unmodifiableSet(Collections.emptySet());
     private static final Pattern TOPOLOGY_NAME_REGEX = Pattern.compile("^[^/.:\\\\]+$");
+    private static final RotatingMap<String, Long> topologyCleanupDetected = new RotatingMap<>(2);
+    private static long topologyCleanupRotationTime = 0L;
 
     // END TOPOLOGY STATE TRANSITIONS
 
@@ -408,6 +424,10 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
     private final StormTimer timer;
     private final IScheduler scheduler;
     private final IScheduler underlyingScheduler;
+    //Metrics related
+    private final AtomicReference<Long> schedulingStartTimeNs = new AtomicReference<>(null);
+    private final AtomicLong longestSchedulingTime = new AtomicLong();
+
     private final ILeaderElector leaderElector;
     private final AssignmentDistributionService assignmentsDistributer;
     private final AtomicReference<Map<String, String>> idToSchedStatus;
@@ -426,6 +446,8 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
     private IAuthorizer authorizationHandler;
     //Cached CuratorFramework, mainly used for BlobStore.
     private CuratorFramework zkClient;
+    //Cached topology -> executor ids, used for deciding timeout workers of heartbeatsCache.
+    private AtomicReference<Map<String, Set<List<Integer>>>> idToExecutors;
     //May be null if worker tokens are not supported by the thrift transport.
     private WorkerTokenManager workerTokenManager;
 
@@ -486,6 +508,7 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
         this.underlyingScheduler = makeScheduler(conf, inimbus);
         this.scheduler = wrapAsBlacklistScheduler(conf, underlyingScheduler);
         this.zkClient = makeZKClient(conf);
+        this.idToExecutors = new AtomicReference<>(new HashMap<>());
 
         if (blobStore == null) {
             blobStore = ServerUtils.getNimbusBlobStore(conf, this.nimbusHostPortInfo, null);
@@ -507,17 +530,17 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
         this.nodeIdToResources = new AtomicReference<>(new HashMap<>());
         this.idToResources = new AtomicReference<>(new HashMap<>());
         this.idToWorkerResources = new AtomicReference<>(new HashMap<>());
-        this.credRenewers = AuthUtils.GetCredentialRenewers(conf);
+        this.credRenewers = ClientAuthUtils.getCredentialRenewers(conf);
         this.topologyHistoryLock = new Object();
         this.topologyHistoryState = ServerConfigUtils.nimbusTopoHistoryState(conf);
-        this.nimbusAutocredPlugins = AuthUtils.getNimbusAutoCredPlugins(conf);
+        this.nimbusAutocredPlugins = ClientAuthUtils.getNimbusAutoCredPlugins(conf);
         this.nimbusTopologyActionNotifier = createTopologyActionNotifier(conf);
         this.clusterConsumerExceutors = makeClusterMetricsConsumerExecutors(conf);
         if (groupMapper == null) {
-            groupMapper = AuthUtils.GetGroupMappingServiceProviderPlugin(conf);
+            groupMapper = ClientAuthUtils.getGroupMappingServiceProviderPlugin(conf);
         }
         this.groupMapper = groupMapper;
-        this.principalToLocal = AuthUtils.GetPrincipalToLocalPlugin(conf);
+        this.principalToLocal = ClientAuthUtils.getPrincipalToLocalPlugin(conf);
         this.supervisorClasspaths = Collections.unmodifiableNavigableMap(
             Utils.getConfiguredClasspathVersions(conf, EMPTY_STRING_LIST));// We don't use the classpath part of this, so just an empty list
     }
@@ -544,6 +567,7 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
             });
     }
 
+    //Not symmetric difference. Performing A.entrySet() - B.entrySet()
     private static <K, V> Map<K, V> mapDiff(Map<? extends K, ? extends V> first, Map<? extends K, ? extends V> second) {
         Map<K, V> ret = new HashMap<>();
         for (Entry<? extends K, ? extends V> entry : second.entrySet()) {
@@ -683,25 +707,19 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
      * @return {topology-id -> {executor [node port]}} mapping
      */
     private static Map<String, Map<List<Long>, List<Object>>> computeTopoToExecToNodePort(
-        Map<String, SchedulerAssignment> schedAssignments) {
+        Map<String, SchedulerAssignment> schedAssignments, List<String> assignedTopologyIds) {
         Map<String, Map<List<Long>, List<Object>>> ret = new HashMap<>();
         for (Entry<String, SchedulerAssignment> schedEntry : schedAssignments.entrySet()) {
             Map<List<Long>, List<Object>> execToNodePort = new HashMap<>();
             for (Entry<ExecutorDetails, WorkerSlot> execAndNodePort : schedEntry.getValue().getExecutorToSlot().entrySet()) {
                 ExecutorDetails exec = execAndNodePort.getKey();
                 WorkerSlot slot = execAndNodePort.getValue();
-
-                List<Long> listExec = new ArrayList<>(2);
-                listExec.add((long) exec.getStartTask());
-                listExec.add((long) exec.getEndTask());
-
-                List<Object> nodePort = new ArrayList<>(2);
-                nodePort.add(slot.getNodeId());
-                nodePort.add((long) slot.getPort());
-
-                execToNodePort.put(listExec, nodePort);
+                execToNodePort.put(exec.toList(), slot.toList());
             }
             ret.put(schedEntry.getKey(), execToNodePort);
+        }
+        for (String id : assignedTopologyIds) {
+            ret.putIfAbsent(id, null);
         }
         return ret;
     }
@@ -729,39 +747,95 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
         return ret;
     }
 
-    private static Map<String, Map<List<Long>, List<Object>>> computeNewTopoToExecToNodePort(
-        Map<String, SchedulerAssignment> schedAssignments, Map<String, Assignment> existingAssignments) {
-        Map<String, Map<List<Long>, List<Object>>> ret = computeTopoToExecToNodePort(schedAssignments);
-        // Print some useful information
-        if (existingAssignments != null && !existingAssignments.isEmpty()) {
-            for (Entry<String, Map<List<Long>, List<Object>>> entry : ret.entrySet()) {
-                String topoId = entry.getKey();
-                Map<List<Long>, List<Object>> execToNodePort = entry.getValue();
-                Assignment assignment = existingAssignments.get(topoId);
-                if (assignment == null) {
-                    continue;
+    private boolean auditAssignmentChanges(Map<String, Assignment> existingAssignments,
+                                           Map<String, Assignment> newAssignments) {
+        assert existingAssignments != null && newAssignments != null;
+        boolean anyChanged = existingAssignments.isEmpty() ^ newAssignments.isEmpty();
+        long numRemovedExec = 0;
+        long numRemovedSlot = 0;
+        long numAddedExec   = 0;
+        long numAddedSlot   = 0;
+        if (existingAssignments.isEmpty()) {
+            for (Entry<String, Assignment> entry : newAssignments.entrySet()) {
+                final Map<List<Long>, NodeInfo> execToPort = entry.getValue().get_executor_node_port();
+                final long count = new HashSet<>(execToPort.values()).size();
+                LOG.info("Assigning {} to {} slots", entry.getKey(), count);
+                LOG.info("Assign executors: {}", execToPort.keySet());
+                numAddedSlot += count;
+                numAddedExec += execToPort.size();
+            }
+        } else if (newAssignments.isEmpty()) {
+            for (Entry<String, Assignment> entry : existingAssignments.entrySet()) {
+                final Map<List<Long>, NodeInfo> execToPort = entry.getValue().get_executor_node_port();
+                final long count = new HashSet<>(execToPort.values()).size();
+                LOG.info("Removing {} from {} slots", entry.getKey(), count);
+                LOG.info("Remove executors: {}", execToPort.keySet());
+                numRemovedSlot += count;
+                numRemovedExec += execToPort.size();
+            }
+        } else {
+            MapDifference<String, Assignment> difference = Maps.difference(existingAssignments, newAssignments);
+            if (anyChanged = !difference.areEqual()) {
+                for (Entry<String, Assignment> entry : difference.entriesOnlyOnLeft().entrySet()) {
+                    final Map<List<Long>, NodeInfo> execToPort = entry.getValue().get_executor_node_port();
+                    final long count = new HashSet<>(execToPort.values()).size();
+                    LOG.info("Removing {} from {} slots", entry.getKey(), count);
+                    LOG.info("Remove executors: {}", execToPort.keySet());
+                    numRemovedSlot += count;
+                    numRemovedExec += execToPort.size();
                 }
-                Map<List<Long>, NodeInfo> old = assignment.get_executor_node_port();
-                Map<List<Long>, List<Object>> reassigned = new HashMap<>();
-                for (Entry<List<Long>, List<Object>> execAndNodePort : execToNodePort.entrySet()) {
-                    NodeInfo oldAssigned = old.get(execAndNodePort.getKey());
-                    String node = (String) execAndNodePort.getValue().get(0);
-                    Long port = (Long) execAndNodePort.getValue().get(1);
-                    if (oldAssigned == null || !oldAssigned.get_node().equals(node)
-                        || !port.equals(oldAssigned.get_port_iterator().next())) {
-                        reassigned.put(execAndNodePort.getKey(), execAndNodePort.getValue());
-                    }
+                for (Entry<String, Assignment> entry : difference.entriesOnlyOnRight().entrySet()) {
+                    final Map<List<Long>, NodeInfo> execToPort = entry.getValue().get_executor_node_port();
+                    final long count = new HashSet<>(execToPort.values()).size();
+                    LOG.info("Assigning {} to {} slots", entry.getKey(), count);
+                    LOG.info("Assign executors: {}", execToPort.keySet());
+                    numAddedSlot += count;
+                    numAddedExec += execToPort.size();
                 }
+                for (Entry<String, MapDifference.ValueDifference<Assignment>> entry : difference.entriesDiffering().entrySet()) {
+                    final Map<List<Long>, NodeInfo> execToSlot = entry.getValue().rightValue().get_executor_node_port();
+                    final Set<NodeInfo> slots = new HashSet<>(execToSlot.values());
+                    LOG.info("Reassigning {} to {} slots", entry.getKey(), slots.size());
+                    LOG.info("Reassign executors: {}", execToSlot.keySet());
 
-                if (!reassigned.isEmpty()) {
-                    int count = (new HashSet<>(execToNodePort.values())).size();
-                    Set<List<Long>> reExecs = reassigned.keySet();
-                    LOG.info("Reassigning {} to {} slots", topoId, count);
-                    LOG.info("Reassign executors: {}", reExecs);
+                    final Map<List<Long>, NodeInfo> oldExecToSlot = entry.getValue().leftValue().get_executor_node_port();
+
+                    long commonExecCount = 0;
+                    Set<NodeInfo> commonSlots = new HashSet<>(execToSlot.size());
+                    for (Entry<List<Long>, NodeInfo> execEntry : execToSlot.entrySet()) {
+                        if (execEntry.getValue().equals(oldExecToSlot.get(execEntry.getKey()))) {
+                            commonExecCount++;
+                            commonSlots.add(execEntry.getValue());
+                        }
+                    }
+                    long commonSlotCount = commonSlots.size();
+
+                    //Treat reassign as remove and add
+                    numRemovedSlot += new HashSet<>(oldExecToSlot.values()).size() - commonSlotCount;
+                    numRemovedExec += oldExecToSlot.size() - commonExecCount;
+                    numAddedSlot += slots.size() - commonSlotCount;
+                    numAddedExec += execToSlot.size() - commonExecCount;
                 }
             }
+            LOG.debug("{} assignments unchanged: {}", difference.entriesInCommon().size(), difference.entriesInCommon().keySet());
         }
-        return ret;
+        numAddedExecPerScheduling.update(numAddedExec);
+        numAddedSlotPerScheduling.update(numAddedSlot);
+        numRemovedExecPerScheduling.update(numRemovedExec);
+        numRemovedSlotPerScheduling.update(numRemovedSlot);
+        numNetExecIncreasePerScheduling.update(numAddedExec - numRemovedExec);
+        numNetSlotIncreasePerScheduling.update(numAddedSlot - numRemovedSlot);
+
+        if (anyChanged) {
+            LOG.info("Fragmentation after scheduling is: {} MB, {} PCore CPUs", fragmentedMemory(), fragmentedCpu());
+            nodeIdToResources.get().forEach((id, node) ->
+                LOG.info(
+                    "Node Id: {} Total Mem: {}, Used Mem: {}, Available Mem: {}, Total CPU: {}, Used "
+                        + "CPU: {}, Available CPU: {}, fragmented: {}",
+                    id, node.getTotalMem(), node.getUsedMem(), node.getAvailableMem(),
+                    node.getTotalCpu(), node.getUsedCpu(), node.getAvailableCpu(), isFragmented(node)));
+        }
+        return anyChanged;
     }
 
     private static List<List<Long>> changedExecutors(Map<List<Long>, NodeInfo> map, Map<List<Long>,
@@ -774,7 +848,7 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
             key.add(ni.get_node());
             key.add(ni.get_port_iterator().next());
             List<List<Long>> value = new ArrayList<>(entry.getValue());
-            value.sort((a, b) -> a.get(0).compareTo(b.get(0)));
+            value.sort(Comparator.comparing(a -> a.get(0)));
             slotAssigned.put(key, value);
         }
         HashMap<List<Object>, List<List<Long>>> tmpNewSlotAssigned = newExecToNodePort == null ? new HashMap<>() :
@@ -782,7 +856,7 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
         HashMap<List<Object>, List<List<Long>>> newSlotAssigned = new HashMap<>();
         for (Entry<List<Object>, List<List<Long>>> entry : tmpNewSlotAssigned.entrySet()) {
             List<List<Long>> value = new ArrayList<>(entry.getValue());
-            value.sort((a, b) -> a.get(0).compareTo(b.get(0)));
+            value.sort(Comparator.comparing(a -> a.get(0)));
             newSlotAssigned.put(entry.getKey(), value);
         }
         Map<List<Object>, List<List<Long>>> diff = mapDiff(slotAssigned, newSlotAssigned);
@@ -815,8 +889,16 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
         return ret;
     }
 
+    /**
+     * NOTE: this can return false when a topology has just been activated.  The topology may still be
+     * in the STORMS_SUBTREE.
+     */
     private static boolean isTopologyActive(IStormClusterState state, String topoName) {
         return state.getTopoId(topoName).isPresent();
+    }
+
+    private static boolean isTopologyActiveOrActivating(IStormClusterState state, String topoName) {
+        return isTopologyActive(state, topoName) || state.activeStorms().contains(topoName);
     }
 
     private static Map<String, Object> tryReadTopoConf(String topoId, TopoCache tc)
@@ -833,14 +915,58 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
         }
     }
 
+    private static void rotateTopologyCleanupMap(long deletionDelay) {
+        if (Time.currentTimeMillis() - topologyCleanupRotationTime > deletionDelay) {
+            topologyCleanupDetected.rotate();
+            topologyCleanupRotationTime = Time.currentTimeMillis();
+        }
+    }
+
+    private static long getTopologyCleanupDetectedTime(String topologyId) {
+        Long firstDetectedForDeletion = topologyCleanupDetected.get(topologyId);
+        if (firstDetectedForDeletion == null) {
+            firstDetectedForDeletion = Time.currentTimeMillis();
+            topologyCleanupDetected.put(topologyId, firstDetectedForDeletion);
+        }
+        return firstDetectedForDeletion;
+    }
+
+    /**
+     * From a set of topologies that have been found to cleanup, return a set that has been detected for a minimum
+     * amount of time. Topology entries first detected less than NIMBUS_TOPOLOGY_BLOBSTORE_DELETION_DELAY_MS ago are
+     * ignored. The delay is to prevent a race conditions such as when a blobstore is created and when the topology
+     * is submitted. It is possible the Nimbus cleanup timer task will find entries to delete between these two events.
+     *
+     * Tracked topology entries are rotated out of the stored map periodically.
+     *
+     * @param toposToClean topologies considered for cleanup
+     * @param conf the nimbus conf
+     * @return the set of topologies that have been detected for cleanup past the expiration time
+     */
+    static Set<String> getExpiredTopologyIds(Set<String> toposToClean, Map<String, Object> conf) {
+        Set<String> idleTopologies = new HashSet<>();
+        long topologyDeletionDelay = ObjectReader.getInt(
+                conf.get(DaemonConfig.NIMBUS_TOPOLOGY_BLOBSTORE_DELETION_DELAY_MS), 5 * 60 * 1000);
+        for (String topologyId : toposToClean) {
+            if (Time.currentTimeMillis() - getTopologyCleanupDetectedTime(topologyId) >= topologyDeletionDelay) {
+                idleTopologies.add(topologyId);
+            }
+        }
+
+        rotateTopologyCleanupMap(topologyDeletionDelay);
+
+        return idleTopologies;
+    }
+
     @VisibleForTesting
-    public static Set<String> topoIdsToClean(IStormClusterState state, BlobStore store) {
+    public static Set<String> topoIdsToClean(IStormClusterState state, BlobStore store, Map<String, Object> conf) {
         Set<String> ret = new HashSet<>();
         ret.addAll(Utils.OR(state.heartbeatStorms(), EMPTY_STRING_LIST));
         ret.addAll(Utils.OR(state.errorTopologies(), EMPTY_STRING_LIST));
         ret.addAll(Utils.OR(store.storedTopoIds(), EMPTY_STRING_SET));
         ret.addAll(Utils.OR(state.backpressureTopologies(), EMPTY_STRING_LIST));
         ret.addAll(Utils.OR(state.idsOfTopologiesWithPrivateWorkerKeys(), EMPTY_STRING_SET));
+        ret = getExpiredTopologyIds(ret, conf);
         ret.removeAll(Utils.OR(state.activeStorms(), EMPTY_STRING_LIST));
         return ret;
     }
@@ -1089,7 +1215,7 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
             nimbus.shutdown();
             server.stop();
         }, 10);
-        if (AuthUtils.areWorkerTokensEnabledServer(server, conf)) {
+        if (ClientAuthUtils.areWorkerTokensEnabledServer(server, conf)) {
             nimbus.initWorkerTokenManager();
         }
         LOG.info("Starting nimbus server for storm version '{}'", STORM_VERSION);
@@ -1159,7 +1285,7 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
             return allNodeHost;
         } else {
             // rebalance
-            Map<String, String> ret = new HashMap();
+            Map<String, String> ret = new HashMap<>();
             for (Map.Entry<List<Long>, NodeInfo> entry : newExecutorNodePort.entrySet()) {
                 NodeInfo newNodeInfo = entry.getValue();
                 NodeInfo oldNodeInfo = oldExecutorNodePort.get(entry.getKey());
@@ -1286,6 +1412,21 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
         return heartbeatsCache;
     }
 
+    public AtomicReference<Map<String, Set<List<Integer>>>> getIdToExecutors() {
+        return idToExecutors;
+    }
+
+    private Set<List<Integer>> getOrUpdateExecutors(String topoId, StormBase base, Map<String, Object> topoConf,
+                                                    StormTopology topology)
+        throws IOException, AuthorizationException, InvalidTopologyException, KeyNotFoundException {
+        Set<List<Integer>> executors = idToExecutors.get().get(topoId);
+        if (null == executors) {
+            executors = new HashSet<>(computeExecutors(topoId, base, topoConf, topology));
+            idToExecutors.getAndUpdate(new Assoc<>(topoId, executors));
+        }
+        return executors;
+    }
+
     private BlobStore getBlobStore() {
         return blobStore;
     }
@@ -1351,6 +1492,7 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
         }
         stormClusterState.updateStorm(topoId, updated);
         updateBlobStore(topoId, rbo, ServerUtils.principalNameToSubject(rbo.get_principal()));
+        idToExecutors.getAndUpdate(new Dissoc<>(topoId)); // remove the executors cache to let it recompute.
         mkAssignments(topoId);
     }
 
@@ -1613,8 +1755,7 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
         return stormClusterState.isAssignmentsBackendSynchronized();
     }
 
-    private Set<List<Integer>> aliveExecutors(TopologyDetails td, Set<List<Integer>> allExecutors, Assignment assignment) {
-        String topoId = td.getId();
+    private Set<List<Integer>> aliveExecutors(String topoId, Set<List<Integer>> allExecutors, Assignment assignment) {
         Map<List<Integer>, Map<String, Object>> hbCache = heartbeatsCache.get().get(topoId);
         //in case that no workers report any heartbeats yet.
         if (null == hbCache) {
@@ -1675,7 +1816,7 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
     private Map<List<Integer>, String> computeExecutorToComponent(String topoId, StormBase base,
                                                                   Map<String, Object> topoConf, StormTopology topology)
         throws KeyNotFoundException, AuthorizationException, InvalidTopologyException, IOException {
-        List<List<Integer>> executors = computeExecutors(topoId, base, topoConf, topology);
+        List<List<Integer>> executors = new ArrayList<>(getOrUpdateExecutors(topoId, base, topoConf, topology));
         Map<Integer, String> taskToComponent = StormCommon.stormTaskInfo(topology, topoConf);
         Map<List<Integer>, String> ret = new HashMap<>();
         for (List<Integer> executor : executors) {
@@ -1690,9 +1831,13 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
         if (bases != null) {
             for (Entry<String, StormBase> entry : bases.entrySet()) {
                 String topoId = entry.getKey();
-                Map<String, Object> topoConf = readTopoConfAsNimbus(topoId, topoCache);
-                StormTopology topology = readStormTopologyAsNimbus(topoId, topoCache);
-                ret.put(topoId, new HashSet<>(computeExecutors(topoId, entry.getValue(), topoConf, topology)));
+                Set<List<Integer>> executors = idToExecutors.get().get(topoId);
+                if (executors == null) {
+                    Map<String, Object> topoConf = readTopoConfAsNimbus(topoId, topoCache);
+                    StormTopology topology = readStormTopologyAsNimbus(topoId, topoCache);
+                    executors = getOrUpdateExecutors(topoId, entry.getValue(), topoConf, topology);
+                }
+                ret.put(topoId, executors);
             }
         }
         return ret;
@@ -1721,7 +1866,7 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
             if (topoId.equals(scratchTopologyId)) {
                 aliveExecutors = allExecutors;
             } else {
-                aliveExecutors = new HashSet<>(aliveExecutors(td, allExecutors, assignment));
+                aliveExecutors = new HashSet<>(aliveExecutors(topoId, allExecutors, assignment));
             }
             ret.put(topoId, aliveExecutors);
         }
@@ -1859,13 +2004,13 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
     }
 
     private double fragmentedMemory() {
-        Double res = nodeIdToResources.get().values().parallelStream().filter(x -> isFragmented(x) == true)
+        Double res = nodeIdToResources.get().values().parallelStream().filter(this::isFragmented)
                                       .mapToDouble(SupervisorResources::getAvailableMem).filter(x -> x > 0).sum();
         return res.intValue();
     }
 
     private int fragmentedCpu() {
-        Double res = nodeIdToResources.get().values().parallelStream().filter(x -> isFragmented(x) == true)
+        Double res = nodeIdToResources.get().values().parallelStream().filter(this::isFragmented)
                                       .mapToDouble(SupervisorResources::getAvailableCpu).filter(x -> x > 0).sum();
         return res.intValue();
     }
@@ -1907,11 +2052,14 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
         Cluster cluster = new Cluster(inimbus, supervisors, topoToSchedAssignment, topologies, conf);
         cluster.setStatusMap(idToSchedStatus.get());
 
-        long beforeSchedule = System.currentTimeMillis();
+        schedulingStartTimeNs.set(Time.nanoTime());
         scheduler.schedule(topologies, cluster);
-        long scheduleTimeElapsedMs = System.currentTimeMillis() - beforeSchedule;
-        LOG.debug("Scheduling took {} ms for {} topologies", scheduleTimeElapsedMs, topologies.getTopologies().size());
-        scheduleTopologyTimeMs.update(scheduleTimeElapsedMs);
+        //Get and set the start time before getting current time in order to avoid potential race with the longest-scheduling-time-ms gauge
+        final Long startTime = schedulingStartTimeNs.getAndSet(null);
+        long elapsed = Time.nanoTime() - startTime;
+        longestSchedulingTime.accumulateAndGet(elapsed, Math::max);
+        schedulingDuration.update(elapsed, TimeUnit.NANOSECONDS);
+        LOG.debug("Scheduling took {} ms for {} topologies", elapsed, topologies.getTopologies().size());
 
         //merge with existing statuses
         idToSchedStatus.set(Utils.merge(idToSchedStatus.get(), cluster.getStatusMap()));
@@ -2020,7 +2168,9 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
         Map<String, StormBase> bases;
         Map<String, TopologyDetails> tds = new HashMap<>();
         synchronized (submitLock) {
+            // should promote: only fetch storm bases of topologies that need scheduling.
             bases = state.topologyBases();
+
             for (Iterator<Entry<String, StormBase>> it = bases.entrySet().iterator(); it.hasNext(); ) {
                 Entry<String, StormBase> entry = it.next();
                 String id = entry.getKey();
@@ -2052,17 +2202,12 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
             }
         }
         // make the new assignments for topologies
-        Map<String, SchedulerAssignment> newSchedulerAssignments = null;
         synchronized (schedLock) {
-            newSchedulerAssignments = computeNewSchedulerAssignments(existingAssignments, topologies, bases, scratchTopoId);
+            Map<String, SchedulerAssignment> newSchedulerAssignments =
+                computeNewSchedulerAssignments(existingAssignments, topologies, bases, scratchTopoId);
 
             Map<String, Map<List<Long>, List<Object>>> topologyToExecutorToNodePort =
-                computeNewTopoToExecToNodePort(newSchedulerAssignments, existingAssignments);
-            for (String id : assignedTopologyIds) {
-                if (!topologyToExecutorToNodePort.containsKey(id)) {
-                    topologyToExecutorToNodePort.put(id, null);
-                }
-            }
+                computeTopoToExecToNodePort(newSchedulerAssignments, assignedTopologyIds);
             Map<String, Map<WorkerSlot, WorkerResources>> newAssignedWorkerToResources =
                 computeTopoToNodePortToResources(newSchedulerAssignments);
             int nowSecs = Time.currentTimeSecs();
@@ -2075,14 +2220,12 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
                 if (execToNodePort == null) {
                     execToNodePort = new HashMap<>();
                 }
-                Assignment existingAssignment = existingAssignments.get(topoId);
                 Set<String> allNodes = new HashSet<>();
-                if (execToNodePort != null) {
-                    for (List<Object> nodePort : execToNodePort.values()) {
-                        allNodes.add((String) nodePort.get(0));
-                    }
+                for (List<Object> nodePort : execToNodePort.values()) {
+                    allNodes.add((String) nodePort.get(0));
                 }
                 Map<String, String> allNodeHost = new HashMap<>();
+                Assignment existingAssignment = existingAssignments.get(topoId);
                 if (existingAssignment != null) {
                     allNodeHost.putAll(existingAssignment.get_node_host());
                 }
@@ -2140,15 +2283,9 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
                 newAssignments.put(topoId, newAssignment);
             }
 
-            if (!newAssignments.equals(existingAssignments)) {
+            boolean assignmentChanged = auditAssignmentChanges(existingAssignments, newAssignments);
+            if (assignmentChanged) {
                 LOG.debug("RESETTING id->resources and id->worker-resources cache!");
-                LOG.info("Fragmentation after scheduling is: {} MB, {} PCore CPUs", fragmentedMemory(), fragmentedCpu());
-                nodeIdToResources.get().forEach((id, node) ->
-                                                    LOG.info(
-                                                        "Node Id: {} Total Mem: {}, Used Mem: {}, Available Mem: {}, Total CPU: {}, Used "
-                                                        + "CPU: {}, Available CPU: {}, fragmented: {}",
-                                                        id, node.getTotalMem(), node.getUsedMem(), node.getAvailableMem(),
-                                                        node.getTotalCpu(), node.getUsedCpu(), node.getAvailableCpu(), isFragmented(node)));
                 idToResources.set(new HashMap<>());
                 idToWorkerResources.set(new HashMap<>());
             }
@@ -2214,13 +2351,13 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
         base.set_principal((String) topoConf.get(Config.TOPOLOGY_SUBMITTER_PRINCIPAL));
     }
 
-    private void startTopology(String topoName, String topoId, TopologyStatus initStatus, String owner, String principal)
+    private void startTopology(String topoName, String topoId, TopologyStatus initStatus, String owner,
+                               String principal, Map<String, Object> topoConf, StormTopology stormTopology)
         throws KeyNotFoundException, AuthorizationException, IOException, InvalidTopologyException {
         assert (TopologyStatus.ACTIVE == initStatus || TopologyStatus.INACTIVE == initStatus);
         IStormClusterState state = stormClusterState;
-        Map<String, Object> topoConf = readTopoConf(topoId, topoCache);
-        StormTopology topology = StormCommon.systemTopology(topoConf, readStormTopology(topoId, topoCache));
         Map<String, Integer> numExecutors = new HashMap<>();
+        StormTopology topology = StormCommon.systemTopology(topoConf, stormTopology);
         for (Entry<String, Object> entry : StormCommon.allComponents(topology).entrySet()) {
             numExecutors.put(entry.getKey(), StormCommon.numStartExecutors(entry.getValue()));
         }
@@ -2238,6 +2375,8 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
         base.set_principal(principal);
         base.set_component_debug(new HashMap<>());
         state.activateStorm(topoId, base, topoConf);
+        idToExecutors.getAndUpdate(new Assoc<>(topoId,
+            new HashSet<>(computeExecutors(topoId, base, topoConf, stormTopology))));
         notifyTopologyActionListener(topoName, "activate");
     }
 
@@ -2384,7 +2523,7 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
         IStormClusterState state = stormClusterState;
         Set<String> toClean;
         synchronized (submitLock) {
-            toClean = topoIdsToClean(state, blobStore);
+            toClean = topoIdsToClean(state, blobStore, this.conf);
         }
         if (toClean != null) {
             for (String topoId : toClean) {
@@ -2397,6 +2536,7 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
                 forceDeleteTopoDistDir(topoId);
                 rmTopologyKeys(topoId);
                 heartbeatsCache.getAndUpdate(new Dissoc<>(topoId));
+                idToExecutors.getAndUpdate(new Dissoc<>(topoId));
             }
         }
     }
@@ -2599,12 +2739,16 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
                 summary.set_assigned_memoffheap(resources.getAssignedMemOffHeap());
                 summary.set_assigned_cpu(resources.getAssignedCpu());
             }
-            summary.set_replication_count(getBlobReplicationCount(ConfigUtils.masterStormCodeKey(topoId)));
+            try {
+                summary.set_replication_count(getBlobReplicationCount(ConfigUtils.masterStormCodeKey(topoId)));
+            } catch (KeyNotFoundException e) {
+                // This could fail if a blob gets deleted by mistake.  Don't crash nimbus.
+                LOG.error("Unable to find blob entry", e);
+            }
             topologySummaries.add(summary);
         }
 
         ClusterSummary ret = new ClusterSummary(summaries, topologySummaries, nimbuses);
-        ret.set_nimbus_uptime_secs(uptime);
         return ret;
     }
 
@@ -2654,7 +2798,7 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
             IStormClusterState state = stormClusterState;
             NimbusInfo hpi = nimbusHostPortInfo;
 
-            LOG.info("Starting Nimbus with conf {}", conf);
+            LOG.info("Starting Nimbus with conf {}", ConfigUtils.maskPasswords(conf));
             validator.prepare(conf);
 
             //add to nimbuses
@@ -2722,34 +2866,45 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
                                     });
 
             StormMetricsRegistry.registerGauge("nimbus:num-supervisors", () -> state.supervisors(null).size());
-            StormMetricsRegistry.registerGauge("nimbus:fragmented-memory", () -> fragmentedMemory());
-            StormMetricsRegistry.registerGauge("nimbus:fragmented-cpu", () -> fragmentedCpu());
-            StormMetricsRegistry.registerGauge("nimbus:available-memory", () -> nodeIdToResources.get().values().parallelStream()
-                                                                                                 .mapToDouble(
-                                                                                                     SupervisorResources::getAvailableMem)
-                                                                                                 .sum());
-            StormMetricsRegistry.registerGauge("nimbus:available-cpu", () -> nodeIdToResources.get().values().parallelStream().mapToDouble(
-                SupervisorResources::getAvailableCpu).sum());
-            StormMetricsRegistry.registerGauge("nimbus:total-memory", () -> nodeIdToResources.get().values().parallelStream()
-                                                                                             .mapToDouble(SupervisorResources::getTotalMem)
-                                                                                             .sum());
-            StormMetricsRegistry.registerGauge("nimbus:total-cpu", () -> nodeIdToResources.get().values().parallelStream()
-                                                                                          .mapToDouble(SupervisorResources::getTotalCpu)
-                                                                                          .sum());
+            StormMetricsRegistry.registerGauge("nimbus:fragmented-memory", this::fragmentedMemory);
+            StormMetricsRegistry.registerGauge("nimbus:fragmented-cpu", this::fragmentedCpu);
+            StormMetricsRegistry.registerGauge("nimbus:available-memory", () -> nodeIdToResources.get().values()
+                .parallelStream()
+                .mapToDouble(SupervisorResources::getAvailableMem)
+                .sum());
+            StormMetricsRegistry.registerGauge("nimbus:available-cpu", () -> nodeIdToResources.get().values()
+                .parallelStream()
+                .mapToDouble(SupervisorResources::getAvailableCpu)
+                .sum());
+            StormMetricsRegistry.registerGauge("nimbus:total-memory", () -> nodeIdToResources.get().values()
+                .parallelStream()
+                .mapToDouble(SupervisorResources::getTotalMem)
+                .sum());
+            StormMetricsRegistry.registerGauge("nimbus:total-cpu", () -> nodeIdToResources.get().values()
+                .parallelStream()
+                .mapToDouble(SupervisorResources::getTotalCpu)
+                .sum());
+            StormMetricsRegistry.registerGauge("nimbus:longest-scheduling-time-ms", () -> {
+                //We want to update longest scheduling time in real time in case scheduler get stuck
+                // Get current time before startTime to avoid potential race with scheduler's Timer
+                Long currTime = Time.nanoTime();
+                Long startTime = schedulingStartTimeNs.get();
+                return TimeUnit.NANOSECONDS.toMillis(startTime == null ?
+                        longestSchedulingTime.get() : Math.max(currTime - startTime, longestSchedulingTime.get()));
+            });
+            StormMetricsRegistry.registerMeter("nimbus:num-launched").mark();
             StormMetricsRegistry.startMetricsReporters(conf);
 
-            if (clusterConsumerExceutors != null) {
-                timer.scheduleRecurring(0, ObjectReader.getInt(conf.get(DaemonConfig.STORM_CLUSTER_METRICS_CONSUMER_PUBLISH_INTERVAL_SECS)),
-                                        () -> {
-                                            try {
-                                                if (isLeader()) {
-                                                    sendClusterMetricsToExecutors();
-                                                }
-                                            } catch (Exception e) {
-                                                throw new RuntimeException(e);
+            timer.scheduleRecurring(0, ObjectReader.getInt(conf.get(DaemonConfig.STORM_CLUSTER_METRICS_CONSUMER_PUBLISH_INTERVAL_SECS)),
+                                    () -> {
+                                        try {
+                                            if (isLeader()) {
+                                                sendClusterMetricsToExecutors();
                                             }
-                                        });
-            }
+                                        } catch (Exception e) {
+                                            throw new RuntimeException(e);
+                                        }
+                                    });
         } catch (Exception e) {
             if (Utils.exceptionCauseIsInstanceOf(InterruptedException.class, e)) {
                 throw e;
@@ -2775,10 +2930,10 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
             final long renewIfExpirationBefore = workerTokenManager.getMaxExpirationTimeForRenewal();
             for (WorkerTokenServiceType type : WorkerTokenServiceType.values()) {
                 boolean shouldAdd = true;
-                WorkerToken oldToken = AuthUtils.readWorkerToken(creds, type);
+                WorkerToken oldToken = ClientAuthUtils.readWorkerToken(creds, type);
                 if (oldToken != null) {
                     try {
-                        WorkerTokenInfo info = AuthUtils.getWorkerTokenInfo(oldToken);
+                        WorkerTokenInfo info = ClientAuthUtils.getWorkerTokenInfo(oldToken);
                         if (info.is_set_expirationTimeMillis() || info.get_expirationTimeMillis() > renewIfExpirationBefore) {
                             //Found an existing token and it is not going to expire any time soon, so don't bother adding in a new
                             // token.
@@ -2790,7 +2945,7 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
                     }
                 }
                 if (shouldAdd) {
-                    AuthUtils.setWorkerToken(creds, workerTokenManager.createOrUpdateTokenFor(type, user, topologyId));
+                    ClientAuthUtils.setWorkerToken(creds, workerTokenManager.createOrUpdateTokenFor(type, user, topologyId));
                 }
             }
             //Remove any expired keys after possibly inserting new ones.
@@ -2919,8 +3074,7 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
                 throw new IllegalArgumentException("The cluster is configured for zookeeper authentication, but no payload was provided.");
             }
             LOG.info("Received topology submission for {} (storm-{} JDK-{}) with conf {}", topoName,
-                     topoVersionString, topology.get_jdk_version(),
-                     Utils.redactValue(topoConf, Config.STORM_ZOOKEEPER_TOPOLOGY_AUTH_PAYLOAD));
+                     topoVersionString, topology.get_jdk_version(), ConfigUtils.maskPasswords(topoConf));
 
             // lock protects against multiple topologies being submitted at once and
             // cleanup thread killing topology in b/w assignment and starting the topology
@@ -2951,7 +3105,7 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
                         throw new IllegalArgumentException("Inital Status of " + options.get_initial_status() + " is not allowed.");
 
                 }
-                startTopology(topoName, topoId, status, topologyOwner, topologyPrincipal);
+                startTopology(topoName, topoId, status, topologyOwner, topologyPrincipal, totalConfToSave, topology);
             }
         } catch (Exception e) {
             LOG.warn("Topology submission exception. (topology name='{}')", topoName, e);
@@ -3313,7 +3467,7 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
         try {
             String sessionId = Utils.uuid();
             blobUploaders.put(sessionId, blobStore.createBlob(key, meta, getSubject()));
-            LOG.info("Created blob for {}", key);
+            LOG.info("Created blob {} for session {}", key, sessionId);
             return sessionId;
         } catch (Exception e) {
             LOG.warn("begin create blob exception.", e);
@@ -3444,7 +3598,7 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
                                                                  (int) conf
                                                                      .getOrDefault(Config.STORM_BLOBSTORE_INPUTSTREAM_BUFFER_SIZE_BYTES,
                                                                                    65536)));
-            LOG.info("Created download session for {}", key);
+            LOG.info("Created download session {} for {}", sessionId, key);
             return ret;
         } catch (Exception e) {
             LOG.warn("begin blob download exception.", e);
@@ -3482,8 +3636,16 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
     }
 
     @Override
-    public void deleteBlob(String key) throws AuthorizationException, KeyNotFoundException, TException {
+    public void deleteBlob(String key) throws AuthorizationException, KeyNotFoundException, IllegalStateException, TException {
         try {
+            String topoName = ConfigUtils.getIdFromBlobKey(key);
+            if (topoName != null) {
+                if (isTopologyActiveOrActivating(stormClusterState, topoName)) {
+                    String message = "Attempting to delete blob " + key + " from under active topology " + topoName;
+                    LOG.warn(message);
+                    throw new WrappedIllegalStateException(message);
+                }
+            }
             blobStore.deleteBlob(key, getSubject());
             LOG.info("Deleted blob for key {}", key);
         } catch (Exception e) {
@@ -3590,7 +3752,7 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
             beginFileUploadCalls.mark();
             checkAuthorization(null, null, "fileUpload");
             String fileloc = getInbox() + "/stormjar-" + Utils.uuid() + ".jar";
-            uploaders.put(fileloc, Channels.newChannel(new FileOutputStream(fileloc)));
+            uploaders.put(fileloc, new TimedWritableByteChannel(Channels.newChannel(new FileOutputStream(fileloc)), fileUploadDuration));
             LOG.info("Uploading file from client to {}", fileloc);
             return fileloc;
         } catch (Exception e) {
@@ -3638,27 +3800,6 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
             uploaders.remove(location);
         } catch (Exception e) {
             LOG.warn("finish file upload exception.", e);
-            if (e instanceof TException) {
-                throw (TException) e;
-            }
-            throw new RuntimeException(e);
-        }
-    }
-
-    @SuppressWarnings("deprecation")
-    @Override
-    public String beginFileDownload(String file) throws AuthorizationException, TException {
-        try {
-            beginFileDownloadCalls.mark();
-            checkAuthorization(null, null, "fileDownload");
-            BufferInputStream is = new BufferInputStream(blobStore.getBlob(file, null),
-                                                         ObjectReader.getInt(conf.get(Config.STORM_BLOBSTORE_INPUTSTREAM_BUFFER_SIZE_BYTES),
-                                                                             65536));
-            String id = Utils.uuid();
-            downloaders.put(id, is);
-            return id;
-        } catch (Exception e) {
-            LOG.warn("begin file download exception.", e);
             if (e instanceof TException) {
                 throw (TException) e;
             }
@@ -4451,7 +4592,7 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
     }
 
     @Override
-    public void processWorkerMetrics(WorkerMetrics metrics) throws org.apache.thrift.TException {
+    public void processWorkerMetrics(WorkerMetrics metrics) throws TException {
         processWorkerMetricsCalls.mark();
 
         checkAuthorization(null, null, "processWorkerMetrics");

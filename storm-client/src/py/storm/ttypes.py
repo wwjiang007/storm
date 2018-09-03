@@ -1921,6 +1921,67 @@ class KeyNotFoundException(TException):
         return not (self == other)
 
 
+class IllegalStateException(TException):
+    """
+    Attributes:
+     - msg
+    """
+
+
+    def __init__(self, msg=None,):
+        self.msg = msg
+
+    def read(self, iprot):
+        if iprot._fast_decode is not None and isinstance(iprot.trans, TTransport.CReadableTransport) and self.thrift_spec is not None:
+            iprot._fast_decode(self, iprot, [self.__class__, self.thrift_spec])
+            return
+        iprot.readStructBegin()
+        while True:
+            (fname, ftype, fid) = iprot.readFieldBegin()
+            if ftype == TType.STOP:
+                break
+            if fid == 1:
+                if ftype == TType.STRING:
+                    self.msg = iprot.readString().decode('utf-8') if sys.version_info[0] == 2 else iprot.readString()
+                else:
+                    iprot.skip(ftype)
+            else:
+                iprot.skip(ftype)
+            iprot.readFieldEnd()
+        iprot.readStructEnd()
+
+    def write(self, oprot):
+        if oprot._fast_encode is not None and self.thrift_spec is not None:
+            oprot.trans.write(oprot._fast_encode(self, [self.__class__, self.thrift_spec]))
+            return
+        oprot.writeStructBegin('IllegalStateException')
+        if self.msg is not None:
+            oprot.writeFieldBegin('msg', TType.STRING, 1)
+            oprot.writeString(self.msg.encode('utf-8') if sys.version_info[0] == 2 else self.msg)
+            oprot.writeFieldEnd()
+        oprot.writeFieldStop()
+        oprot.writeStructEnd()
+
+    def validate(self):
+        if self.msg is None:
+            raise TProtocolException(message='Required field msg is unset!')
+        return
+
+    def __str__(self):
+        return repr(self)
+
+    def __repr__(self):
+        L = ['%s=%r' % (key, value)
+             for key, value in self.__dict__.items()]
+        return '%s(%s)' % (self.__class__.__name__, ', '.join(L))
+
+    def __eq__(self, other):
+        return isinstance(other, self.__class__) and self.__dict__ == other.__dict__
+
+    def __ne__(self, other):
+        return not (self == other)
+
+
 class KeyAlreadyExistsException(TException):
     """
     Attributes:
@@ -2539,15 +2600,13 @@ class ClusterSummary(object):
     """
     Attributes:
      - supervisors
-     - nimbus_uptime_secs
      - topologies
      - nimbuses
     """
 
 
-    def __init__(self, supervisors=None, nimbus_uptime_secs=0, topologies=None, nimbuses=None,):
+    def __init__(self, supervisors=None, topologies=None, nimbuses=None,):
         self.supervisors = supervisors
-        self.nimbus_uptime_secs = nimbus_uptime_secs
         self.topologies = topologies
         self.nimbuses = nimbuses
 
@@ -2569,11 +2628,6 @@ class ClusterSummary(object):
                         _elem126.read(iprot)
                         self.supervisors.append(_elem126)
                     iprot.readListEnd()
-                else:
-                    iprot.skip(ftype)
-            elif fid == 2:
-                if ftype == TType.I32:
-                    self.nimbus_uptime_secs = iprot.readI32()
                 else:
                     iprot.skip(ftype)
             elif fid == 3:
@@ -2614,10 +2668,6 @@ class ClusterSummary(object):
             for iter139 in self.supervisors:
                 iter139.write(oprot)
             oprot.writeListEnd()
-            oprot.writeFieldEnd()
-        if self.nimbus_uptime_secs is not None:
-            oprot.writeFieldBegin('nimbus_uptime_secs', TType.I32, 2)
-            oprot.writeI32(self.nimbus_uptime_secs)
             oprot.writeFieldEnd()
         if self.topologies is not None:
             oprot.writeFieldBegin('topologies', TType.LIST, 3)
@@ -10201,6 +10251,11 @@ KeyNotFoundException.thrift_spec = (
     None,  # 0
     (1, TType.STRING, 'msg', 'UTF8', None, ),  # 1
 )
+all_structs.append(IllegalStateException)
+IllegalStateException.thrift_spec = (
+    None,  # 0
+    (1, TType.STRING, 'msg', 'UTF8', None, ),  # 1
+)
 all_structs.append(KeyAlreadyExistsException)
 KeyAlreadyExistsException.thrift_spec = (
     None,  # 0
@@ -10764,7 +10819,7 @@ all_structs.append(ClusterSummary)
 ClusterSummary.thrift_spec = (
     None,  # 0
     (1, TType.LIST, 'supervisors', (TType.STRUCT, [SupervisorSummary, None], False), None, ),  # 1
-    (2, TType.I32, 'nimbus_uptime_secs', None, 0, ),  # 2
+    None,  # 2
     (3, TType.LIST, 'topologies', (TType.STRUCT, [TopologySummary, None], False), None, ),  # 3
     (4, TType.LIST, 'nimbuses', (TType.STRUCT, [NimbusSummary, None], False), None, ),  # 4
 )

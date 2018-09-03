@@ -19,7 +19,6 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import org.apache.commons.io.FileUtils;
 import org.apache.storm.generated.LSApprovedWorkers;
 import org.apache.storm.generated.LSSupervisorAssignments;
 import org.apache.storm.generated.LSSupervisorId;
@@ -29,9 +28,10 @@ import org.apache.storm.generated.LSWorkerHeartbeat;
 import org.apache.storm.generated.LocalAssignment;
 import org.apache.storm.generated.LocalStateData;
 import org.apache.storm.generated.ThriftSerializedObject;
-import org.apache.thrift.TBase;
-import org.apache.thrift.TDeserializer;
-import org.apache.thrift.TSerializer;
+import org.apache.storm.shade.org.apache.commons.io.FileUtils;
+import org.apache.storm.thrift.TBase;
+import org.apache.storm.thrift.TDeserializer;
+import org.apache.storm.thrift.TSerializer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -47,9 +47,9 @@ public class LocalState {
     public static final String LS_TOPO_HISTORY = "topo-hist";
     private VersionedStore _vs;
 
-    public LocalState(String backingDir) throws IOException {
+    public LocalState(String backingDir, boolean createBackingDir) throws IOException {
         LOG.debug("New Local State for {}", backingDir);
-        _vs = new VersionedStore(backingDir);
+        _vs = new VersionedStore(backingDir, createBackingDir);
     }
 
     public synchronized Map<String, TBase> snapshot() {
@@ -256,9 +256,9 @@ public class LocalState {
             File file = new File(newPath);
             FileUtils.writeByteArrayToFile(file, toWrite);
             if (toWrite.length != file.length()) {
-                throw new IOException("Tried to serialize " + toWrite.length +
-                                      " bytes to " + file.getCanonicalPath() + ", but " +
-                                      file.length() + " bytes were written.");
+                throw new IOException("Tried to serialize " + toWrite.length
+                                      + " bytes to " + file.getCanonicalPath() + ", but "
+                                      + file.length() + " bytes were written.");
             }
             _vs.succeedVersion(newPath);
             if (cleanup) {

@@ -21,11 +21,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
-import org.apache.commons.lang.StringUtils;
 import org.apache.storm.Config;
 import org.apache.storm.Constants;
 import org.apache.storm.Thrift;
-import org.apache.storm.cluster.IStormClusterState;
 import org.apache.storm.generated.Bolt;
 import org.apache.storm.generated.ComponentCommon;
 import org.apache.storm.generated.GlobalStreamId;
@@ -42,6 +40,8 @@ import org.apache.storm.metric.SystemBolt;
 import org.apache.storm.metric.filter.FilterByMetricName;
 import org.apache.storm.metric.util.DataPointExpander;
 import org.apache.storm.security.auth.IAuthorizer;
+import org.apache.storm.shade.org.apache.commons.lang.StringUtils;
+import org.apache.storm.shade.org.json.simple.JSONValue;
 import org.apache.storm.task.IBolt;
 import org.apache.storm.task.WorkerTopologyContext;
 import org.apache.storm.tuple.Fields;
@@ -49,7 +49,6 @@ import org.apache.storm.utils.ConfigUtils;
 import org.apache.storm.utils.ObjectReader;
 import org.apache.storm.utils.Utils;
 import org.apache.storm.utils.WrappedInvalidTopologyException;
-import org.json.simple.JSONValue;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -83,11 +82,6 @@ public class StormCommon {
         StormCommon oldInstance = _instance;
         _instance = common;
         return oldInstance;
-    }
-
-    @Deprecated
-    public static String getStormId(final IStormClusterState stormClusterState, final String topologyName) {
-        return stormClusterState.getTopoId(topologyName).get();
     }
 
     public static void validateDistributedMode(Map<String, Object> conf) {

@@ -27,6 +27,7 @@ import org.apache.storm.scheduler.blacklist.strategies.IBlacklistStrategy;
 import org.apache.storm.scheduler.resource.strategies.priority.ISchedulingPriorityStrategy;
 import org.apache.storm.scheduler.resource.strategies.scheduling.IStrategy;
 import org.apache.storm.security.auth.IAuthorizer;
+import org.apache.storm.security.auth.IHttpCredentialsPlugin;
 import org.apache.storm.validation.ConfigValidation;
 import org.apache.storm.validation.Validated;
 
@@ -43,6 +44,7 @@ import static org.apache.storm.validation.ConfigValidationAnnotations.isPositive
 import static org.apache.storm.validation.ConfigValidationAnnotations.isString;
 import static org.apache.storm.validation.ConfigValidationAnnotations.isStringList;
 import static org.apache.storm.validation.ConfigValidationAnnotations.isStringOrStringList;
+import static org.apache.storm.validation.ConfigValidationAnnotations.Password;
 
 /**
  * Storm configs are specified as a plain old map. This class provides constants for all the configurations possible on a Storm cluster.
@@ -280,6 +282,12 @@ public class DaemonConfig implements Validated {
     public static final String NIMBUS_WORKER_HEARTBEATS_RECOVERY_STRATEGY_CLASS = "nimbus.worker.heartbeats.recovery.strategy.class";
 
     /**
+     * This controls the number of milliseconds nimbus will wait before deleting a topology blobstore once detected it is able to delete.
+     */
+    @isInteger
+    public static final String NIMBUS_TOPOLOGY_BLOBSTORE_DELETION_DELAY_MS = "nimbus.topology.blobstore.deletion.delay.ms";
+
+    /**
      * Storm UI binds to this host/interface.
      */
     @isString
@@ -367,6 +375,7 @@ public class DaemonConfig implements Validated {
      * Password for the keystore for HTTPS for Storm Logviewer.
      */
     @isString
+    @Password
     public static final String LOGVIEWER_HTTPS_KEYSTORE_PASSWORD = "logviewer.https.keystore.password";
 
     /**
@@ -380,6 +389,7 @@ public class DaemonConfig implements Validated {
      * Password to the private key in the keystore for setting up HTTPS (SSL).
      */
     @isString
+    @Password
     public static final String LOGVIEWER_HTTPS_KEY_PASSWORD = "logviewer.https.key.password";
 
     /**
@@ -392,6 +402,7 @@ public class DaemonConfig implements Validated {
      * Password for the truststore for HTTPS for Storm Logviewer.
      */
     @isString
+    @Password
     public static final String LOGVIEWER_HTTPS_TRUSTSTORE_PASSWORD = "logviewer.https.truststore.password";
 
     /**
@@ -470,6 +481,7 @@ public class DaemonConfig implements Validated {
      * Password to the keystore used by Storm UI for setting up HTTPS (SSL).
      */
     @isString
+    @Password
     public static final String UI_HTTPS_KEYSTORE_PASSWORD = "ui.https.keystore.password";
 
     /**
@@ -484,6 +496,7 @@ public class DaemonConfig implements Validated {
      * Password to the private key in the keystore for setting up HTTPS (SSL).
      */
     @isString
+    @Password
     public static final String UI_HTTPS_KEY_PASSWORD = "ui.https.key.password";
 
     /**
@@ -496,6 +509,7 @@ public class DaemonConfig implements Validated {
      * Password to the truststore used by Storm UI setting up HTTPS (SSL).
      */
     @isString
+    @Password
     public static final String UI_HTTPS_TRUSTSTORE_PASSWORD = "ui.https.truststore.password";
 
     /**
@@ -552,6 +566,7 @@ public class DaemonConfig implements Validated {
      * Password to the keystore used by Storm DRPC for setting up HTTPS (SSL).
      */
     @isString
+    @Password
     public static final String DRPC_HTTPS_KEYSTORE_PASSWORD = "drpc.https.keystore.password";
 
     /**
@@ -566,6 +581,7 @@ public class DaemonConfig implements Validated {
      * Password to the private key in the keystore for setting up HTTPS (SSL).
      */
     @isString
+    @Password
     public static final String DRPC_HTTPS_KEY_PASSWORD = "drpc.https.key.password";
 
     /**
@@ -578,6 +594,7 @@ public class DaemonConfig implements Validated {
      * Password to the truststore used by Storm DRPC setting up HTTPS (SSL).
      */
     @isString
+    @Password
     public static final String DRPC_HTTPS_TRUSTSTORE_PASSWORD = "drpc.https.truststore.password";
 
     /**
@@ -977,6 +994,19 @@ public class DaemonConfig implements Validated {
      */
     @isImplementationOfClass(implementsClass = IStrategy.class)
     public static final String VALIDATE_TOPOLOGY_SCHEDULER_STRATEGY = Config.TOPOLOGY_SCHEDULER_STRATEGY;
+
+    /**
+     * Class name of the HTTP credentials plugin for the UI.
+     */
+    @isImplementationOfClass(implementsClass = IHttpCredentialsPlugin.class)
+    public static final String UI_HTTP_CREDS_PLUGIN = "ui.http.creds.plugin";
+
+    /**
+     * Class name of the HTTP credentials plugin for DRPC.
+     */
+    @isImplementationOfClass(implementsClass = IHttpCredentialsPlugin.class)
+    public static final String DRPC_HTTP_CREDS_PLUGIN = "drpc.http.creds.plugin";
+
     /**
      * root directory for cgoups.
      */

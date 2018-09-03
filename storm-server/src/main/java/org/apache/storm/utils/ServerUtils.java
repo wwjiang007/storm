@@ -28,11 +28,9 @@ import java.io.FileWriter;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.io.PrintStream;
 import java.io.RandomAccessFile;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
-import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.attribute.PosixFilePermission;
@@ -45,7 +43,6 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.ZipEntry;
@@ -80,7 +77,7 @@ import org.apache.storm.nimbus.NimbusInfo;
 import org.apache.storm.scheduler.resource.ResourceUtils;
 import org.apache.storm.scheduler.resource.normalization.NormalizedResourceRequest;
 import org.apache.storm.security.auth.SingleUserPrincipal;
-import org.apache.thrift.TException;
+import org.apache.storm.thrift.TException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -639,15 +636,14 @@ public class ServerUtils {
      * @throws IOException
      */
     public static long zipFileSize(File myFile) throws IOException {
-        RandomAccessFile raf = new RandomAccessFile(myFile, "r");
-        raf.seek(raf.length() - 4);
-        long b4 = raf.read();
-        long b3 = raf.read();
-        long b2 = raf.read();
-        long b1 = raf.read();
-        long val = (b1 << 24) | (b2 << 16) + (b3 << 8) + b4;
-        raf.close();
-        return val;
+        try (RandomAccessFile raf = new RandomAccessFile(myFile, "r")) {
+            raf.seek(raf.length() - 4);
+            long b4 = raf.read();
+            long b3 = raf.read();
+            long b2 = raf.read();
+            long b1 = raf.read();
+            return (b1 << 24) | (b2 << 16) + (b3 << 8) + b4;
+        }
     }
 
     private static boolean downloadResourcesAsSupervisorAttempt(ClientBlobStore cb, String key, String localFile) {

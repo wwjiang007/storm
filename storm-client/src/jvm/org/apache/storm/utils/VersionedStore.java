@@ -18,16 +18,24 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
-import org.apache.commons.io.FileUtils;
+import org.apache.storm.shade.org.apache.commons.io.FileUtils;
 
 public class VersionedStore {
     private static final String FINISHED_VERSION_SUFFIX = ".version";
 
     private String _root;
 
-    public VersionedStore(String path) throws IOException {
+    /**
+     * Creates a store at the given path.
+     *
+     * @param The path for the store
+     * @param createRootDir option to create the path directory
+     */
+    public VersionedStore(String path, boolean createRootDir) throws IOException {
         _root = path;
-        mkdirs(_root);
+        if (createRootDir) {
+            mkdirs(_root);
+        }
     }
 
     public String getRoot() {
@@ -133,7 +141,7 @@ public class VersionedStore {
     }
 
     /**
-     * Sorted from most recent to oldest
+     * Sorted from most recent to oldest.
      */
     public List<Long> getAllVersions() throws IOException {
         List<Long> ret = new ArrayList<Long>();

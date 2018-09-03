@@ -18,7 +18,6 @@
 
 package org.apache.storm.scheduler;
 
-import com.google.common.annotations.VisibleForTesting;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -40,6 +39,7 @@ import org.apache.storm.networktopography.DefaultRackDNSToSwitchMapping;
 import org.apache.storm.scheduler.resource.normalization.NormalizedResourceOffer;
 import org.apache.storm.scheduler.resource.normalization.NormalizedResourceRequest;
 import org.apache.storm.scheduler.resource.normalization.NormalizedResources;
+import org.apache.storm.shade.com.google.common.annotations.VisibleForTesting;
 import org.apache.storm.utils.ConfigUtils;
 import org.apache.storm.utils.ObjectReader;
 import org.apache.storm.utils.ReflectionUtils;
@@ -145,11 +145,7 @@ public class Cluster implements ISchedulingState {
             String nodeId = entry.getKey();
             SupervisorDetails supervisor = entry.getValue();
             String host = supervisor.getHost();
-            List<String> ids = hostToId.get(host);
-            if (ids == null) {
-                ids = new ArrayList<>();
-                hostToId.put(host, ids);
-            }
+            List<String> ids = hostToId.computeIfAbsent(host, k -> new ArrayList<>());
             ids.add(nodeId);
         }
         this.conf = conf;
@@ -173,11 +169,7 @@ public class Cluster implements ISchedulingState {
             for (Map.Entry<String, String> entry : resolvedSuperVisors.entrySet()) {
                 String hostName = entry.getKey();
                 String rack = entry.getValue();
-                List<String> nodesForRack = this.networkTopography.get(rack);
-                if (nodesForRack == null) {
-                    nodesForRack = new ArrayList<>();
-                    this.networkTopography.put(rack, nodesForRack);
-                }
+                List<String> nodesForRack = this.networkTopography.computeIfAbsent(rack, k -> new ArrayList<>());
                 nodesForRack.add(hostName);
             }
         } else {

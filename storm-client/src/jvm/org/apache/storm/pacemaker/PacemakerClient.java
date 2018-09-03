@@ -16,7 +16,6 @@ import java.net.InetSocketAddress;
 import java.util.Map;
 import java.util.Timer;
 import java.util.TimerTask;
-import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -27,12 +26,16 @@ import org.apache.storm.generated.HBMessage;
 import org.apache.storm.messaging.netty.ISaslClient;
 import org.apache.storm.messaging.netty.NettyRenameThreadFactory;
 import org.apache.storm.pacemaker.codec.ThriftNettyClientCodec;
-import org.apache.storm.security.auth.AuthUtils;
+import org.apache.storm.security.auth.ClientAuthUtils;
+import org.apache.storm.shade.io.netty.bootstrap.Bootstrap;
+import org.apache.storm.shade.io.netty.buffer.PooledByteBufAllocator;
+import org.apache.storm.shade.io.netty.channel.Channel;
+import org.apache.storm.shade.io.netty.channel.ChannelOption;
+import org.apache.storm.shade.io.netty.channel.EventLoopGroup;
+import org.apache.storm.shade.io.netty.channel.WriteBufferWaterMark;
+import org.apache.storm.shade.io.netty.channel.nio.NioEventLoopGroup;
+import org.apache.storm.shade.io.netty.channel.socket.nio.NioSocketChannel;
 import org.apache.storm.utils.StormBoundedExponentialBackoffRetry;
-import org.jboss.netty.bootstrap.ClientBootstrap;
-import org.jboss.netty.channel.Channel;
-import org.jboss.netty.channel.ChannelPipelineFactory;
-import org.jboss.netty.channel.socket.nio.NioClientSocketChannelFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -40,7 +43,8 @@ public class PacemakerClient implements ISaslClient {
 
     private static final Logger LOG = LoggerFactory.getLogger(PacemakerClient.class);
     private static Timer timer = new Timer(true);
-    private final ClientBootstrap bootstrap;
+    private final Bootstrap bootstrap;
+    private final EventLoopGroup workerEventLoopGroup;
     private String client_name;
     private String secret;
     private AtomicBoolean ready;
@@ -52,32 +56,28 @@ public class PacemakerClient implements ISaslClient {
     private LinkedBlockingQueue<Integer> availableMessageSlots;
     private ThriftNettyClientCodec.AuthMethod authMethod;
     private static final int maxRetries = 10;
+    private String host;
 
     private StormBoundedExponentialBackoffRetry backoff = new StormBoundedExponentialBackoffRetry(100, 5000, 20);
     private int retryTimes = 0;
 
-    //the constructor is invoked by pacemaker-state-factory-test
-    public PacemakerClient() {
-        bootstrap = new ClientBootstrap();
-    }
-
     public PacemakerClient(Map<String, Object> config, String host) {
-
+        this.host = host;
         int port = (int) config.get(Config.PACEMAKER_PORT);
         client_name = (String) config.get(Config.TOPOLOGY_NAME);
         if (client_name == null) {
             client_name = "pacemaker-client";
         }
+        int maxWorkers = (int)config.get(Config.PACEMAKER_CLIENT_MAX_THREADS);
 
         String auth = (String) config.get(Config.PACEMAKER_AUTH_METHOD);
-        ThriftNettyClientCodec.AuthMethod authMethod;
 
         switch (auth) {
 
             case "DIGEST":
-                Configuration login_conf = AuthUtils.GetConfiguration(config);
+                Configuration login_conf = ClientAuthUtils.getConfiguration(config);
                 authMethod = ThriftNettyClientCodec.AuthMethod.DIGEST;
-                secret = AuthUtils.makeDigestPayload(login_conf, AuthUtils.LOGIN_CONTEXT_PACEMAKER_DIGEST);
+                secret = ClientAuthUtils.makeDigestPayload(login_conf, ClientAuthUtils.LOGIN_CONTEXT_PACEMAKER_DIGEST);
                 if (secret == null) {
                     LOG.error("Can't start pacemaker server without digest secret.");
                     throw new RuntimeException("Can't start pacemaker server without digest secret.");
@@ -100,23 +100,25 @@ public class PacemakerClient implements ISaslClient {
 
         ready = new AtomicBoolean(false);
         shutdown = new AtomicBoolean(false);
-        channelRef = new AtomicReference<Channel>(null);
+        channelRef = new AtomicReference<>(null);
         setupMessaging();
 
-        ThreadFactory bossFactory = new NettyRenameThreadFactory("client-boss");
-        ThreadFactory workerFactory = new NettyRenameThreadFactory("client-worker");
-        NioClientSocketChannelFactory factory =
-            new NioClientSocketChannelFactory(Executors.newCachedThreadPool(bossFactory), Executors.newCachedThreadPool(workerFactory));
-        bootstrap = new ClientBootstrap(factory);
-        bootstrap.setOption("tcpNoDelay", true);
-        bootstrap.setOption("sendBufferSize", 5242880);
-        bootstrap.setOption("keepAlive", true);
+        ThreadFactory workerFactory = new NettyRenameThreadFactory(this.host + "-pm");
+        // 0 means DEFAULT_EVENT_LOOP_THREADS
+        // https://github.com/netty/netty/blob/netty-4.1.24.Final/transport/src/main/java/io/netty/channel/MultithreadEventLoopGroup.java#L40
+        this.workerEventLoopGroup = new NioEventLoopGroup(maxWorkers > 0 ? maxWorkers : 0, workerFactory);
+        int thriftMessageMaxSize = (Integer) config.get(Config.PACEMAKER_THRIFT_MESSAGE_SIZE_MAX);
+        bootstrap = new Bootstrap()
+            .group(workerEventLoopGroup)
+            .channel(NioSocketChannel.class)
+            .option(ChannelOption.TCP_NODELAY, true)
+            .option(ChannelOption.SO_SNDBUF, 5242880)
+            .option(ChannelOption.SO_KEEPALIVE, true)
+            .option(ChannelOption.WRITE_BUFFER_WATER_MARK, new WriteBufferWaterMark(8 * 1024, 32 * 1024))
+            .option(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
+            .handler(new ThriftNettyClientCodec(this, config, authMethod, host, thriftMessageMaxSize));
 
         remote_addr = new InetSocketAddress(host, port);
-        int thriftMessageMaxSize = (Integer) config.get(Config.PACEMAKER_THRIFT_MESSAGE_SIZE_MAX);
-        ChannelPipelineFactory pipelineFactory =
-            new ThriftNettyClientCodec(this, config, authMethod, host, thriftMessageMaxSize).pipelineFactory();
-        bootstrap.setPipelineFactory(pipelineFactory);
         bootstrap.connect(remote_addr);
     }
 
@@ -129,27 +131,16 @@ public class PacemakerClient implements ISaslClient {
     }
 
     @Override
-    public synchronized void channelConnected(Channel channel) {
+    public synchronized void channelReady(Channel channel) {
         Channel oldChannel = channelRef.get();
         if (oldChannel != null) {
             LOG.debug("Closing oldChannel is connected: {}", oldChannel.toString());
             close_channel();
         }
 
-        LOG.debug("Channel is connected: {}", channel.toString());
         channelRef.set(channel);
-
-        //If we're not going to authenticate, we can begin sending.
-        if (authMethod == ThriftNettyClientCodec.AuthMethod.NONE) {
-            ready.set(true);
-            this.notifyAll();
-        }
         retryTimes = 0;
-    }
-
-    @Override
-    public synchronized void channelReady() {
-        LOG.debug("Channel is ready.");
+        LOG.debug("Channel is ready: {}", channel.toString());
         ready.set(true);
         this.notifyAll();
     }
@@ -163,20 +154,20 @@ public class PacemakerClient implements ISaslClient {
     }
 
     public HBMessage send(HBMessage m) throws PacemakerConnectionException, InterruptedException {
-        LOG.debug("Sending message: {}", m.toString());
+        LOG.debug("Sending pacemaker message to {}: {}", host, m);
 
         int next = availableMessageSlots.take();
         synchronized (m) {
             m.set_message_id(next);
             messages[next] = m;
-            LOG.debug("Put message in slot: {}", Integer.toString(next));
+            LOG.debug("Put message in slot: {} for {}", Integer.toString(next), host);
             int retry = maxRetries;
             while (true) {
                 try {
                     waitUntilReady();
                     Channel channel = channelRef.get();
                     if (channel != null) {
-                        channel.write(m);
+                        channel.writeAndFlush(m, channel.voidPromise());
                         m.wait(1000);
                     }
                     if (messages[next] != m && messages[next] != null) {
@@ -196,7 +187,7 @@ public class PacemakerClient implements ISaslClient {
                     throw new PacemakerConnectionException("couldn't get response after " + maxRetries + " attempts.");
                 }
                 retry--;
-                LOG.error("Not getting response or getting null response. Making {} more attempts.", retry);
+                LOG.error("Not getting response or getting null response. Making {} more attempts for {}.", retry, host);
             }
         }
     }
@@ -249,6 +240,7 @@ public class PacemakerClient implements ISaslClient {
     }
 
     public synchronized void doReconnect() {
+        LOG.info("reconnecting to {}", host);
         close_channel();
         if (!shutdown.get()) {
             bootstrap.connect(remote_addr);
@@ -257,7 +249,7 @@ public class PacemakerClient implements ISaslClient {
 
     public void shutdown() {
         shutdown.set(true);
-        bootstrap.releaseExternalResources();
+        workerEventLoopGroup.shutdownGracefully().awaitUninterruptibly();
     }
 
     private synchronized void close_channel() {

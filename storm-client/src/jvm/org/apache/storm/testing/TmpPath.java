@@ -13,7 +13,7 @@
 package org.apache.storm.testing;
 
 import java.io.File;
-import org.apache.commons.io.FileUtils;
+import org.apache.storm.shade.org.apache.commons.io.FileUtils;
 import org.apache.storm.utils.Utils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -48,7 +48,7 @@ public class TmpPath implements AutoCloseable {
     }
 
     @Override
-    public void close() throws Exception {
+    public void close() {
         if (path.exists()) {
             try {
                 FileUtils.forceDelete(path);

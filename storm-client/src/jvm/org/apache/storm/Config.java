@@ -36,6 +36,7 @@ import org.apache.storm.validation.ConfigValidation.MetricRegistryValidator;
 import org.apache.storm.validation.ConfigValidation.MetricReportersValidator;
 import org.apache.storm.validation.ConfigValidationAnnotations.CustomValidator;
 import org.apache.storm.validation.ConfigValidationAnnotations.NotNull;
+import org.apache.storm.validation.ConfigValidationAnnotations.Password;
 import org.apache.storm.validation.ConfigValidationAnnotations.isBoolean;
 import org.apache.storm.validation.ConfigValidationAnnotations.isImplementationOfClass;
 import org.apache.storm.validation.ConfigValidationAnnotations.isInteger;
@@ -875,6 +876,14 @@ public class Config extends HashMap<String, Object> {
     @isPositiveNumber
     public static final String PACEMAKER_PORT = "pacemaker.port";
     /**
+     * The maximum number of threads that should be used by the Pacemaker client.
+     * When Pacemaker gets loaded it will spawn new threads, up to
+     * this many total, to handle the load.
+     */
+    @isNumber
+    @isPositiveNumber
+    public static final String PACEMAKER_CLIENT_MAX_THREADS = "pacemaker.client.max.threads";
+    /**
      * This should be one of "DIGEST", "KERBEROS", or "NONE" Determines the mode of authentication the pacemaker server and client use. The
      * client must either match the server, or be NONE. In the case of NONE, no authentication is performed for the client, and if the
      * server is running with DIGEST or KERBEROS, the client can only write to the server (no reads). This is intended to provide a
@@ -1107,13 +1116,6 @@ public class Config extends HashMap<String, Object> {
     @isString
     public static final String STORM_LOCAL_HOSTNAME = "storm.local.hostname";
     /**
-     * The host that the master server is running on, added only for backward compatibility, the usage deprecated in favor of nimbus.seeds
-     * config.
-     */
-    @Deprecated
-    @isString
-    public static final String NIMBUS_HOST = "nimbus.host";
-    /**
      * List of seed nimbus hosts to use for leader nimbus discovery.
      */
     @isStringList
@@ -1145,6 +1147,7 @@ public class Config extends HashMap<String, Object> {
      * authentication.
      */
     @isString
+    @Password
     public static final String STORM_ZOOKEEPER_TOPOLOGY_AUTH_PAYLOAD = "storm.zookeeper.topology.auth.payload";
     /**
      * The cluster Zookeeper authentication scheme to use, e.g. "digest". Defaults to no authentication.
@@ -1301,14 +1304,6 @@ public class Config extends HashMap<String, Object> {
     @isInteger
     public static final String STORM_NETTY_MESSAGE_BATCH_SIZE = "storm.messaging.netty.transfer.batch.size";
     /**
-     * Netty based messaging: The max # of retries that a peer will perform when a remote is not accessible
-     *
-     * @deprecated "Since netty clients should never stop reconnecting - this does not make sense anymore.
-     */
-    @Deprecated
-    @isInteger
-    public static final String STORM_MESSAGING_NETTY_MAX_RETRIES = "storm.messaging.netty.max_retries";
-    /**
      * Netty based messaging: The min # of milliseconds that a peer will wait.
      */
     @isInteger
@@ -1362,16 +1357,7 @@ public class Config extends HashMap<String, Object> {
      */
     @isStringList
     public static final String NIMBUS_AUTO_CRED_PLUGINS = "nimbus.autocredential.plugins.classes";
-    /**
-     * Class name of the HTTP credentials plugin for the UI.
-     */
-    @isString
-    public static final String UI_HTTP_CREDS_PLUGIN = "ui.http.creds.plugin";
-    /**
-     * Class name of the HTTP credentials plugin for DRPC.
-     */
-    @isString
-    public static final String DRPC_HTTP_CREDS_PLUGIN = "drpc.http.creds.plugin";
+
     /**
      * A list of users that run the supervisors and should be authorized to interact with nimbus as a supervisor would.  To use this set
      * nimbus.authorizer to org.apache.storm.security.auth.authorizer.SimpleACLAuthorizer.
