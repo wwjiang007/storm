@@ -29,11 +29,13 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.atomic.AtomicLong;
 import org.apache.storm.Config;
+import org.apache.storm.DaemonConfig;
 import org.apache.storm.generated.StormTopology;
 import org.apache.storm.generated.WorkerResources;
 import org.apache.storm.scheduler.Cluster;
 import org.apache.storm.scheduler.ExecutorDetails;
 import org.apache.storm.scheduler.INimbus;
+import org.apache.storm.scheduler.IScheduler;
 import org.apache.storm.scheduler.SchedulerAssignment;
 import org.apache.storm.scheduler.SupervisorDetails;
 import org.apache.storm.scheduler.SupervisorResources;
@@ -41,21 +43,48 @@ import org.apache.storm.scheduler.Topologies;
 import org.apache.storm.scheduler.TopologyDetails;
 import org.apache.storm.scheduler.WorkerSlot;
 import org.apache.storm.scheduler.resource.ResourceAwareScheduler;
+import org.apache.storm.scheduler.resource.TestUtilsForResourceAwareScheduler;
 import org.apache.storm.topology.SharedOffHeapWithinNode;
 import org.apache.storm.topology.SharedOffHeapWithinWorker;
 import org.apache.storm.topology.SharedOnHeap;
 import org.apache.storm.topology.TopologyBuilder;
+import org.junit.After;
 import org.junit.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import static org.apache.storm.scheduler.resource.TestUtilsForResourceAwareScheduler.*;
 import static org.junit.Assert.*;
 
+import org.apache.storm.metric.StormMetricsRegistry;
+import org.apache.storm.scheduler.resource.normalization.ResourceMetrics;
+
 public class TestGenericResourceAwareStrategy {
     private static final Logger LOG = LoggerFactory.getLogger(TestGenericResourceAwareStrategy.class);
 
-    private static int currentTime = 1450418597;
+    private final int currentTime = 1450418597;
+    private IScheduler scheduler = null;
+
+    @After
+    public void cleanup() {
+        if (scheduler != null) {
+            scheduler.cleanup();
+            scheduler = null;
+        }
+    }
+
+    protected Class getGenericResourceAwareStrategyClass() {
+        return GenericResourceAwareStrategy.class;
+    }
+
+    private Config createGrasClusterConfig(double compPcore, double compOnHeap, double compOffHeap,
+                                                 Map<String, Map<String, Number>> pools, Map<String, Double> genericResourceMap) {
+        Config config = TestUtilsForResourceAwareScheduler.createGrasClusterConfig(compPcore, compOnHeap, compOffHeap, pools, genericResourceMap);
+        config.put(Config.TOPOLOGY_SCHEDULER_STRATEGY, getGenericResourceAwareStrategyClass().getName());
+        return config;
+    }
 
     /**
      * test if the scheduling logic for the GenericResourceAwareStrategy is correct.
@@ -99,12 +128,12 @@ public class TestGenericResourceAwareStrategy {
 
         Topologies topologies = new Topologies(topo);
 
-        Cluster cluster = new Cluster(iNimbus, supMap, new HashMap<>(), topologies, conf);
+        Cluster cluster = new Cluster(iNimbus, new ResourceMetrics(new StormMetricsRegistry()), supMap, new HashMap<>(), topologies, conf);
 
-        ResourceAwareScheduler rs = new ResourceAwareScheduler();
+        scheduler = new ResourceAwareScheduler();
 
-        rs.prepare(conf);
-        rs.schedule(topologies, cluster);
+        scheduler.prepare(conf, new StormMetricsRegistry());
+        scheduler.schedule(topologies, cluster);
         
         for (Entry<String, SupervisorResources> entry: cluster.getSupervisorsResourcesMap().entrySet()) {
             String supervisorId = entry.getKey();
@@ -126,7 +155,7 @@ public class TestGenericResourceAwareStrategy {
         
         SchedulerAssignment assignment = cluster.getAssignmentById(topo.getId());
         Set<WorkerSlot> slots = assignment.getSlots();
-        Map<String, Double> nodeToTotalShared = assignment.getNodeIdToTotalSharedOffHeapMemory();
+        Map<String, Double> nodeToTotalShared = assignment.getNodeIdToTotalSharedOffHeapNodeMemory();
         LOG.info("NODE TO SHARED OFF HEAP {}", nodeToTotalShared);
         Map<WorkerSlot, WorkerResources> scheduledResources = assignment.getScheduledResources();
         assertEquals(2, slots.size());
@@ -187,12 +216,12 @@ public class TestGenericResourceAwareStrategy {
                 genExecsAndComps(stormToplogy), currentTime, "user");
 
         Topologies topologies = new Topologies(topo);
-        Cluster cluster = new Cluster(iNimbus, supMap, new HashMap<>(), topologies, conf);
+        Cluster cluster = new Cluster(iNimbus, new ResourceMetrics(new StormMetricsRegistry()), supMap, new HashMap<>(), topologies, conf);
 
-        ResourceAwareScheduler rs = new ResourceAwareScheduler();
+        scheduler = new ResourceAwareScheduler();
 
-        rs.prepare(conf);
-        rs.schedule(topologies, cluster);
+        scheduler.prepare(conf, new StormMetricsRegistry());
+        scheduler.schedule(topologies, cluster);
 
         //We need to have 3 slots on 3 separate hosts. The topology needs 6 GPUs 3500 MB memory and 350% CPU
         // The bolt-3 instances must be on separate nodes because they each need 2 GPUs.
@@ -222,6 +251,132 @@ public class TestGenericResourceAwareStrategy {
         assertEquals(expectedScheduling, foundScheduling);
     }
 
+    private TopologyDetails createTestStormTopology(StormTopology stormTopology, int priority, String name, Config conf) {
+        conf.put(Config.TOPOLOGY_PRIORITY, priority);
+        conf.put(Config.TOPOLOGY_NAME, name);
+        return new TopologyDetails(name , conf, stormTopology, 0,
+                genExecsAndComps(stormTopology), currentTime, "user");
+    }
+
+    /*
+     * test requiring eviction until Generic Resource (gpu) is evicted.
+     */
+    @Test
+    public void testGrasRequiringEviction() {
+        int spoutParallelism = 3;
+        double cpuPercent = 10;
+        double memoryOnHeap = 10;
+        double memoryOffHeap = 10;
+        // Sufficient Cpu/Memory. But insufficient gpu to schedule all topologies (gpu1, noGpu, gpu2).
+
+        // gpu topology (requires 3 gpu's in total)
+        TopologyBuilder builder = new TopologyBuilder();
+        builder.setSpout("spout", new TestSpout(), spoutParallelism).addResource("gpu.count", 1.0);
+        StormTopology stormTopologyWithGpu = builder.createTopology();
+
+        // non-gpu topology
+        builder = new TopologyBuilder();
+        builder.setSpout("spout", new TestSpout(), spoutParallelism);
+        StormTopology stormTopologyNoGpu = builder.createTopology();
+
+        Config conf = createGrasClusterConfig(cpuPercent, memoryOnHeap, memoryOffHeap, null, Collections.emptyMap());
+        conf.put(DaemonConfig.RESOURCE_AWARE_SCHEDULER_MAX_TOPOLOGY_SCHEDULING_ATTEMPTS, 2);    // allow 1 round of evictions
+
+        String gpu1 = "hasGpu1";
+        String noGpu = "hasNoGpu";
+        String gpu2 = "hasGpu2";
+        TopologyDetails topo[] = {
+                createTestStormTopology(stormTopologyWithGpu, 10, gpu1, conf),
+                createTestStormTopology(stormTopologyNoGpu, 10, noGpu, conf),
+                createTestStormTopology(stormTopologyWithGpu, 9, gpu2, conf)
+        };
+        Topologies topologies = new Topologies(topo[0], topo[1]);
+
+        Map<String, Double> genericResourcesMap = new HashMap<>();
+        genericResourcesMap.put("gpu.count", 1.0);
+        Map<String, SupervisorDetails> supMap = genSupervisors(4, 4, 500, 2000, genericResourcesMap);
+        Cluster cluster = new Cluster(new INimbusTest(), new ResourceMetrics(new StormMetricsRegistry()), supMap, new HashMap<>(), topologies, conf);
+
+        // should schedule gpu1 and noGpu successfully
+        scheduler = new ResourceAwareScheduler();
+        scheduler.prepare(conf, new StormMetricsRegistry());
+        scheduler.schedule(topologies, cluster);
+        assertTopologiesFullyScheduled(cluster, gpu1);
+        assertTopologiesFullyScheduled(cluster, noGpu);
+
+        // should evict gpu1 and noGpu topologies in order to schedule gpu2 topology; then fail to reschedule gpu1 topology;
+        // then schedule noGpu topology.
+        // Scheduling used to ignore gpu resource when deciding when to stop evicting, and gpu2 would fail to schedule.
+        topologies = new Topologies(topo[0], topo[1], topo[2]);
+        cluster = new Cluster(cluster, topologies);
+        scheduler.schedule(topologies, cluster);
+        assertTopologiesNotScheduled(cluster, gpu1);
+        assertTopologiesFullyScheduled(cluster, noGpu);
+        assertTopologiesFullyScheduled(cluster, gpu2);
+    }
+    
+    /**
+     * test if the scheduling logic for the GenericResourceAwareStrategy (when in favor of shuffle) is correct.
+     */
+    public void testGenericResourceAwareStrategyInFavorOfShuffle() {
+        int spoutParallelism = 1;
+        int boltParallelism = 2;
+        TopologyBuilder builder = new TopologyBuilder();
+        builder.setSpout("spout", new TestSpout(),
+            spoutParallelism);
+        builder.setBolt("bolt-1", new TestBolt(),
+            boltParallelism).shuffleGrouping("spout");
+        builder.setBolt("bolt-2", new TestBolt(),
+            boltParallelism).shuffleGrouping("bolt-1").addResource("gpu.count", 1.0);
+        builder.setBolt("bolt-3", new TestBolt(),
+            boltParallelism).shuffleGrouping("bolt-2").addResource("gpu.count", 2.0);
+
+        StormTopology stormToplogy = builder.createTopology();
+
+        INimbus iNimbus = new INimbusTest();
+
+        Config conf = createGrasClusterConfig(50, 250, 250, null, Collections.emptyMap());
+        Map<String, Double> genericResourcesMap = new HashMap<>();
+        genericResourcesMap.put("gpu.count", 2.0);
+        Map<String, SupervisorDetails> supMap = genSupervisors(4, 4, 150, 1500, genericResourcesMap);
+
+
+        conf.put(Config.TOPOLOGY_PRIORITY, 0);
+        conf.put(Config.TOPOLOGY_NAME, "testTopology");
+        conf.put(Config.TOPOLOGY_WORKER_MAX_HEAP_SIZE_MB, Double.MAX_VALUE);
+        conf.put(Config.TOPOLOGY_SUBMITTER_USER, "user");
+        conf.put(Config.TOPOLOGY_RAS_ORDER_EXECUTORS_BY_PROXIMITY_NEEDS, true);
+
+        TopologyDetails topo = new TopologyDetails("testTopology-id", conf, stormToplogy, 0,
+            genExecsAndComps(stormToplogy), currentTime, "user");
+
+        Topologies topologies = new Topologies(topo);
+        Cluster cluster = new Cluster(iNimbus, new ResourceMetrics(new StormMetricsRegistry()), supMap, new HashMap<>(), topologies, conf);
+
+        ResourceAwareScheduler rs = new ResourceAwareScheduler();
+
+        rs.prepare(conf, new StormMetricsRegistry());
+        rs.schedule(topologies, cluster);
+
+        HashSet<HashSet<ExecutorDetails>> expectedScheduling = new HashSet<>();
+        expectedScheduling.add(new HashSet<>(Arrays.asList(
+            new ExecutorDetails(0, 0),
+            new ExecutorDetails(2, 2),
+            new ExecutorDetails(6, 6))));
+        expectedScheduling.add(new HashSet<>(Arrays.asList(
+            new ExecutorDetails(4, 4),
+            new ExecutorDetails(1, 1))));
+        expectedScheduling.add(new HashSet<>(Arrays.asList(new ExecutorDetails(5, 5))));
+        expectedScheduling.add(new HashSet<>(Arrays.asList(new ExecutorDetails(3, 3))));
+        HashSet<HashSet<ExecutorDetails>> foundScheduling = new HashSet<>();
+        SchedulerAssignment assignment = cluster.getAssignmentById("testTopology-id");
+        for (Collection<ExecutorDetails> execs : assignment.getSlotToExecutors().values()) {
+            foundScheduling.add(new HashSet<>(execs));
+        }
+
+        assertEquals(expectedScheduling, foundScheduling);
+    }
+
     @Test
     public void testAntiAffinityWithMultipleTopologies() {
         INimbus iNimbus = new INimbusTest();
@@ -233,16 +388,16 @@ public class TestGenericResourceAwareStrategy {
         Config config = new Config();
         config.putAll(createGrasClusterConfig(88, 775, 25, null, null));
 
-        ResourceAwareScheduler rs = new ResourceAwareScheduler();
-        rs.prepare(config);
+        scheduler = new ResourceAwareScheduler();
+        scheduler.prepare(config, new StormMetricsRegistry());
 
         TopologyDetails tdSimple = genTopology("topology-simple", config, 1,
             5, 100, 300, 0, 0, "user", 8192);
 
         //Schedule the simple topology first
         Topologies topologies = new Topologies(tdSimple);
-        Cluster cluster = new Cluster(iNimbus, supMap, new HashMap<>(), topologies, config);
-        rs.schedule(topologies, cluster);
+        Cluster cluster = new Cluster(iNimbus, new ResourceMetrics(new StormMetricsRegistry()), supMap, new HashMap<>(), topologies, config);
+        scheduler.schedule(topologies, cluster);
 
         TopologyBuilder builder = topologyBuilder(1, 5, 100, 300);
         builder.setBolt("gpu-bolt", new TestBolt(), 40)
@@ -253,7 +408,7 @@ public class TestGenericResourceAwareStrategy {
         //Now schedule GPU but with the simple topology in place.
         topologies = new Topologies(tdSimple, tdGpu);
         cluster = new Cluster(cluster, topologies);
-        rs.schedule(topologies, cluster);
+        scheduler.schedule(topologies, cluster);
 
         Map<String, SchedulerAssignment> assignments = new TreeMap<>(cluster.getAssignments());
         assertEquals(2, assignments.size());

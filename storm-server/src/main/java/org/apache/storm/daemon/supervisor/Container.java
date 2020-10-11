@@ -20,21 +20,20 @@ package org.apache.storm.daemon.supervisor;
 
 import com.codahale.metrics.Meter;
 import com.codahale.metrics.Timer;
-import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
-import java.io.InputStreamReader;
 import java.io.Writer;
-import java.lang.ProcessBuilder.Redirect;
 import java.nio.file.Files;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+
+import org.apache.commons.lang.StringUtils;
 import org.apache.storm.Config;
 import org.apache.storm.DaemonConfig;
 import org.apache.storm.container.ResourceIsolationInterface;
@@ -49,8 +48,8 @@ import org.apache.storm.metricstore.MetricException;
 import org.apache.storm.metricstore.WorkerMetricsProcessor;
 import org.apache.storm.utils.ConfigUtils;
 import org.apache.storm.utils.LocalState;
+import org.apache.storm.utils.ObjectReader;
 import org.apache.storm.utils.ServerConfigUtils;
-import org.apache.storm.utils.ServerUtils;
 import org.apache.storm.utils.Utils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -65,164 +64,130 @@ public abstract class Container implements Killable {
     private static final String SYSTEM_COMPONENT_ID = "System";
     private static final String INVALID_EXECUTOR_ID = "-1";
     private static final String INVALID_STREAM_ID = "None";
-    private static final ConcurrentHashMap<Integer, TopoAndMemory> _usedMemory =
-        new ConcurrentHashMap<>();
-    private static final ConcurrentHashMap<Integer, TopoAndMemory> _reservedMemory =
-        new ConcurrentHashMap<>();
+    private static final Map<String, Integer> cachedUserToUidMap = new ConcurrentHashMap<>();
 
-    private static final Meter numCleanupExceptions = StormMetricsRegistry.registerMeter("supervisor:num-cleanup-exceptions");
-    private static final Meter numKillExceptions = StormMetricsRegistry.registerMeter("supervisor:num-kill-exceptions");
-    private static final Meter numForceKillExceptions = StormMetricsRegistry.registerMeter("supervisor:num-force-kill-exceptions");
-    private static final Meter numForceKill = StormMetricsRegistry.registerMeter("supervisor:num-workers-force-kill");
-    private static final Timer shutdownDuration = StormMetricsRegistry.registerTimer("supervisor:worker-shutdown-duration-ns");
-    private static final Timer cleanupDuration = StormMetricsRegistry.registerTimer("supervisor:worker-per-call-clean-up-duration-ns");
-
-    static {
-        StormMetricsRegistry.registerGauge(
-            "supervisor:current-used-memory-mb",
-            () -> {
-                Long val =
-                    _usedMemory.values().stream().mapToLong((topoAndMem) -> topoAndMem.memory).sum();
-                int ret = val.intValue();
-                if (val > Integer.MAX_VALUE) { // Would only happen at 2 PB so we are OK for now
-                    ret = Integer.MAX_VALUE;
-                }
-                return ret;
-            });
-        StormMetricsRegistry.registerGauge(
-            "supervisor:current-reserved-memory-mb",
-            () -> {
-                Long val =
-                    _reservedMemory.values().stream().mapToLong((topoAndMem) -> topoAndMem.memory).sum();
-                int ret = val.intValue();
-                if (val > Integer.MAX_VALUE) { // Would only happen at 2 PB so we are OK for now
-                    ret = Integer.MAX_VALUE;
-                }
-                return ret;
-            });
-    }
-
-    protected final Map<String, Object> _conf;
-    protected final Map<String, Object> _topoConf; //Not set if RECOVER_PARTIAL
-    protected final String _topologyId; //Not set if RECOVER_PARTIAL
-    protected final String _supervisorId;
-    protected final int _supervisorPort;
-    protected final int _port; //Not set if RECOVER_PARTIAL
-    protected final LocalAssignment _assignment; //Not set if RECOVER_PARTIAL
-    protected final AdvancedFSOps _ops;
-    protected final ResourceIsolationInterface _resourceIsolationManager;
-    protected final boolean _symlinksDisabled;
-    protected String _workerId;
-    protected ContainerType _type;
+    private final Meter numCleanupExceptions;
+    private final Meter numKillExceptions;
+    private final Meter numForceKillExceptions;
+    private final Meter numForceKill;
+    private final Timer shutdownDuration;
+    private final Timer cleanupDuration;
+    protected final Map<String, Object> conf;
+    protected final Map<String, Object> topoConf; //Not set if RECOVER_PARTIAL
+    protected final String topologyId; //Not set if RECOVER_PARTIAL
+    protected final String supervisorId;
+    protected final int supervisorPort;
+    protected final int port; //Not set if RECOVER_PARTIAL
+    protected final LocalAssignment assignment; //Not set if RECOVER_PARTIAL
+    protected final AdvancedFSOps ops;
+    protected final ResourceIsolationInterface resourceIsolationManager;
+    protected final boolean symlinksDisabled;
+    protected String workerId;
+    protected ContainerType type;
+    protected ContainerMemoryTracker containerMemoryTracker;
     private long lastMetricProcessTime = 0L;
     private Timer.Context shutdownTimer = null;
+    protected boolean runAsUser;
+    private String cachedUser;
 
     /**
      * Create a new Container.
      *
-     * @param type                     the type of container being made.
-     * @param conf                     the supervisor config
-     * @param supervisorId             the ID of the supervisor this is a part of.
-     * @param supervisorPort           the thrift server port of the supervisor this is a part of.
-     * @param port                     the port the container is on.  Should be <= 0 if only a partial recovery
-     * @param assignment               the assignment for this container. Should be null if only a partial recovery.
+     * @param type the type of container being made.
+     * @param conf the supervisor config
+     * @param supervisorId the ID of the supervisor this is a part of.
+     * @param supervisorPort the thrift server port of the supervisor this is a part of.
+     * @param port the port the container is on. Should be <= 0 if only a partial recovery @param assignment
+     *     the assignment for this container. Should be null if only a partial recovery.
      * @param resourceIsolationManager used to isolate resources for a container can be null if no isolation is used.
-     * @param workerId                 the id of the worker to use.  Must not be null if doing a partial recovery.
-     * @param topoConf                 the config of the topology (mostly for testing) if null and not a partial recovery the real conf is
-     *                                 read.
-     * @param ops                      file system operations (mostly for testing) if null a new one is made
+     * @param workerId the id of the worker to use. Must not be null if doing a partial recovery.
+     * @param topoConf the config of the topology (mostly for testing) if null and not a partial recovery the real conf is read.
+     * @param ops file system operations (mostly for testing) if null a new one is made
+     * @param metricsRegistry The metrics registry.
+     * @param containerMemoryTracker The shared memory tracker for the supervisor's containers
      * @throws IOException on any error.
      */
     protected Container(ContainerType type, Map<String, Object> conf, String supervisorId, int supervisorPort,
-                        int port, LocalAssignment assignment, ResourceIsolationInterface resourceIsolationManager,
-                        String workerId, Map<String, Object> topoConf, AdvancedFSOps ops) throws IOException {
+        int port, LocalAssignment assignment, ResourceIsolationInterface resourceIsolationManager,
+        String workerId, Map<String, Object> topoConf, AdvancedFSOps ops,
+        StormMetricsRegistry metricsRegistry, ContainerMemoryTracker containerMemoryTracker) throws IOException {
         assert (type != null);
         assert (conf != null);
         assert (supervisorId != null);
 
-        _symlinksDisabled = (boolean) conf.getOrDefault(Config.DISABLE_SYMLINKS, false);
+        symlinksDisabled = (boolean) conf.getOrDefault(Config.DISABLE_SYMLINKS, false);
 
         if (ops == null) {
             ops = AdvancedFSOps.make(conf);
         }
 
-        _workerId = workerId;
-        _type = type;
-        _port = port;
-        _ops = ops;
-        _conf = conf;
-        _supervisorId = supervisorId;
-        _supervisorPort = supervisorPort;
-        _resourceIsolationManager = resourceIsolationManager;
-        _assignment = assignment;
+        this.workerId = workerId;
+        this.type = type;
+        this.port = port;
+        this.ops = ops;
+        this.conf = conf;
+        this.supervisorId = supervisorId;
+        this.supervisorPort = supervisorPort;
+        this.resourceIsolationManager = resourceIsolationManager;
+        this.assignment = assignment;
 
-        if (_type.isOnlyKillable()) {
-            assert (_assignment == null);
-            assert (_port <= 0);
-            assert (_workerId != null);
-            _topologyId = null;
-            _topoConf = null;
+        runAsUser = ObjectReader.getBoolean(conf.get(Config.SUPERVISOR_RUN_WORKER_AS_USER), false);
+        if (runAsUser && Utils.isOnWindows()) {
+            throw new UnsupportedOperationException("ERROR: Windows doesn't support running workers as different users yet");
+        }
+
+        if (this.type.isOnlyKillable()) {
+            assert (this.assignment == null);
+            assert (this.port <= 0);
+            assert (this.workerId != null);
+            topologyId = null;
+            this.topoConf = null;
         } else {
             assert (assignment != null);
             assert (port > 0);
-            _topologyId = assignment.get_topology_id();
-            if (!_ops.doRequiredTopoFilesExist(_conf, _topologyId)) {
+            topologyId = assignment.get_topology_id();
+            if (!this.ops.doRequiredTopoFilesExist(this.conf, topologyId)) {
                 LOG.info(
                     "Missing topology storm code, so can't launch  worker with assignment {} for this supervisor {} on port {} with id {}",
-                    _assignment,
-                    _supervisorId, _port, _workerId);
+                        this.assignment,
+                        this.supervisorId, this.port, this.workerId);
                 throw new ContainerRecoveryException("Missing required topology files...");
             }
             if (topoConf == null) {
-                _topoConf = readTopoConf();
+                this.topoConf = readTopoConf();
             } else {
                 //For testing...
-                _topoConf = topoConf;
+                this.topoConf = topoConf;
             }
         }
+        this.numCleanupExceptions = metricsRegistry.registerMeter("supervisor:num-cleanup-exceptions");
+        this.numKillExceptions = metricsRegistry.registerMeter("supervisor:num-kill-exceptions");
+        this.numForceKillExceptions = metricsRegistry.registerMeter("supervisor:num-force-kill-exceptions");
+        this.numForceKill = metricsRegistry.registerMeter("supervisor:num-workers-force-kill");
+        this.shutdownDuration = metricsRegistry.registerTimer("supervisor:worker-shutdown-duration-ns");
+        this.cleanupDuration = metricsRegistry.registerTimer("supervisor:worker-per-call-clean-up-duration-ns");
+        this.containerMemoryTracker = containerMemoryTracker;
     }
 
     @Override
     public String toString() {
-        return "topo:" + _topologyId + " worker:" + _workerId;
+        return "topo:" + topologyId + " worker:" + workerId;
     }
 
     protected Map<String, Object> readTopoConf() throws IOException {
-        assert (_topologyId != null);
-        return ConfigUtils.readSupervisorStormConf(_conf, _topologyId);
-    }
-
-    /**
-     * Kill a given process.
-     *
-     * @param pid the id of the process to kill
-     * @throws IOException
-     */
-    protected void kill(long pid) throws IOException {
-        ServerUtils.killProcessWithSigTerm(String.valueOf(pid));
-    }
-
-    /**
-     * Kill a given process.
-     *
-     * @param pid the id of the process to kill
-     * @throws IOException
-     */
-    protected void forceKill(long pid) throws IOException {
-        ServerUtils.forceKillProcess(String.valueOf(pid));
+        assert (topologyId != null);
+        return ConfigUtils.readSupervisorStormConf(conf, topologyId);
     }
 
     @Override
     public void kill() throws IOException {
-        LOG.info("Killing {}:{}", _supervisorId, _workerId);
+        LOG.info("Killing {}:{}", supervisorId, workerId);
         if (shutdownTimer == null) {
             shutdownTimer = shutdownDuration.time();
         }
         try {
-            Set<Long> pids = getAllPids();
-
-            for (Long pid : pids) {
-                kill(pid);
+            if (resourceIsolationManager != null) {
+                resourceIsolationManager.kill(getWorkerUser(), workerId);
             }
         } catch (IOException e) {
             numKillExceptions.mark();
@@ -232,13 +197,11 @@ public abstract class Container implements Killable {
 
     @Override
     public void forceKill() throws IOException {
-        LOG.info("Force Killing {}:{}", _supervisorId, _workerId);
+        LOG.info("Force Killing {}:{}", supervisorId, workerId);
         numForceKill.mark();
         try {
-            Set<Long> pids = getAllPids();
-
-            for (Long pid : pids) {
-                forceKill(pid);
+            if (resourceIsolationManager != null) {
+                resourceIsolationManager.forceKill(getWorkerUser(), workerId);
             }
         } catch (IOException e) {
             numForceKillExceptions.mark();
@@ -254,94 +217,17 @@ public abstract class Container implements Killable {
      * @throws IOException on any error
      */
     public LSWorkerHeartbeat readHeartbeat() throws IOException {
-        LocalState localState = ConfigUtils.workerState(_conf, _workerId);
+        LocalState localState = ConfigUtils.workerState(conf, workerId);
         LSWorkerHeartbeat hb = localState.getWorkerHeartBeat();
-        LOG.trace("{}: Reading heartbeat {}", _workerId, hb);
+        LOG.trace("{}: Reading heartbeat {}", workerId, hb);
         return hb;
-    }
-
-    /**
-     * Is a process alive and running?.
-     *
-     * @param pid  the PID of the running process
-     * @param user the user that is expected to own that process
-     * @return true if it is, else false
-     *
-     * @throws IOException on any error
-     */
-    protected boolean isProcessAlive(long pid, String user) throws IOException {
-        if (ServerUtils.IS_ON_WINDOWS) {
-            return isWindowsProcessAlive(pid, user);
-        }
-        return isPosixProcessAlive(pid, user);
-    }
-
-    private boolean isWindowsProcessAlive(long pid, String user) throws IOException {
-        boolean ret = false;
-        ProcessBuilder pb = new ProcessBuilder("tasklist", "/fo", "list", "/fi", "pid eq " + pid, "/v");
-        pb.redirectError(Redirect.INHERIT);
-        Process p = pb.start();
-        try (BufferedReader in = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
-            String read;
-            while ((read = in.readLine()) != null) {
-                if (read.contains("User Name:")) { //Check for : in case someone called their user "User Name"
-                    //This line contains the user name for the pid we're looking up
-                    //Example line: "User Name:    exampleDomain\exampleUser"
-                    List<String> userNameLineSplitOnWhitespace = Arrays.asList(read.split(":"));
-                    if (userNameLineSplitOnWhitespace.size() == 2) {
-                        List<String> userAndMaybeDomain = Arrays.asList(userNameLineSplitOnWhitespace.get(1).trim().split("\\\\"));
-                        String processUser = userAndMaybeDomain.size() == 2 ? userAndMaybeDomain.get(1) : userAndMaybeDomain.get(0);
-                        if (user.equals(processUser)) {
-                            ret = true;
-                        } else {
-                            LOG.info("Found {} running as {}, but expected it to be {}", pid, processUser, user);
-                        }
-                    } else {
-                        LOG.error("Received unexpected output from tasklist command. Expected one colon in user name line. Line was {}",
-                                  read);
-                    }
-                    break;
-                }
-            }
-        }
-        return ret;
-    }
-
-    private boolean isPosixProcessAlive(long pid, String user) throws IOException {
-        boolean ret = false;
-        ProcessBuilder pb = new ProcessBuilder("ps", "-o", "user", "-p", String.valueOf(pid));
-        pb.redirectError(Redirect.INHERIT);
-        Process p = pb.start();
-        try (BufferedReader in = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
-            String first = in.readLine();
-            assert ("USER".equals(first));
-            String processUser;
-            while ((processUser = in.readLine()) != null) {
-                if (user.equals(processUser)) {
-                    ret = true;
-                    break;
-                } else {
-                    LOG.info("Found {} running as {}, but expected it to be {}", pid, processUser, user);
-                }
-            }
-        }
-        return ret;
     }
 
     @Override
     public boolean areAllProcessesDead() throws IOException {
-        Set<Long> pids = getAllPids();
-        String user = getRunWorkerAsUser();
-        
         boolean allDead = true;
-        for (Long pid: pids) {
-            LOG.debug("Checking if pid {} owner {} is alive", pid, user);
-            if (!isProcessAlive(pid, user)) {
-                LOG.debug("{}: PID {} is dead", _workerId, pid);
-            } else {
-                allDead = false;
-                break;
-            }
+        if (resourceIsolationManager != null) {
+            allDead = resourceIsolationManager.areAllProcessesDead(getWorkerUser(), workerId);
         }
 
         if (allDead && shutdownTimer != null) {
@@ -355,8 +241,7 @@ public abstract class Container implements Killable {
     @Override
     public void cleanUp() throws IOException {
         try (Timer.Context t = cleanupDuration.time()) {
-            _usedMemory.remove(_port);
-            _reservedMemory.remove(_port);
+            containerMemoryTracker.remove(port);
             cleanUpForRestart();
         } catch (IOException e) {
             //This may or may not be reported depending on when process exits
@@ -366,29 +251,29 @@ public abstract class Container implements Killable {
     }
 
     /**
-     * Setup the container to run.  By default this creates the needed directories/links in the local file system PREREQUISITE: All needed
+     * Setup the container to run. By default this creates the needed directories/links in the local file system PREREQUISITE: All needed
      * blobs and topology, jars/configs have been downloaded and placed in the appropriate locations
      *
      * @throws IOException on any error
      */
     protected void setup() throws IOException {
-        _type.assertFull();
-        if (!_ops.doRequiredTopoFilesExist(_conf, _topologyId)) {
+        type.assertFull();
+        if (!ops.doRequiredTopoFilesExist(conf, topologyId)) {
             LOG.info("Missing topology storm code, so can't launch  worker with assignment {} for this supervisor {} on port {} with id {}",
-                     _assignment,
-                     _supervisorId, _port, _workerId);
+                    assignment,
+                    supervisorId, port, workerId);
             throw new IllegalStateException("Not all needed files are here!!!!");
         }
-        LOG.info("Setting up {}:{}", _supervisorId, _workerId);
+        LOG.info("Setting up {}:{}", supervisorId, workerId);
 
-        _ops.forceMkdir(new File(ConfigUtils.workerPidsRoot(_conf, _workerId)));
-        _ops.forceMkdir(new File(ConfigUtils.workerTmpRoot(_conf, _workerId)));
-        _ops.forceMkdir(new File(ConfigUtils.workerHeartbeatsRoot(_conf, _workerId)));
+        ops.forceMkdir(new File(ConfigUtils.workerPidsRoot(conf, workerId)));
+        ops.forceMkdir(new File(ConfigUtils.workerTmpRoot(conf, workerId)));
+        ops.forceMkdir(new File(ConfigUtils.workerHeartbeatsRoot(conf, workerId)));
 
-        File workerArtifacts = new File(ConfigUtils.workerArtifactsRoot(_conf, _topologyId, _port));
-        if (!_ops.fileExists(workerArtifacts)) {
-            _ops.forceMkdir(workerArtifacts);
-            _ops.setupWorkerArtifactsDir(_assignment.get_owner(), workerArtifacts);
+        File workerArtifacts = new File(ConfigUtils.workerArtifactsRoot(conf, topologyId, port));
+        if (!ops.fileExists(workerArtifacts)) {
+            ops.forceMkdir(workerArtifacts);
+            ops.setupWorkerArtifactsDir(assignment.get_owner(), workerArtifacts);
         }
 
         String user = getWorkerUser();
@@ -404,45 +289,45 @@ public abstract class Container implements Killable {
      * @param user the user this is going to run as
      * @throws IOException on any error
      */
-    @SuppressWarnings("unchecked")
     protected void writeLogMetadata(String user) throws IOException {
-        _type.assertFull();
+        type.assertFull();
         Map<String, Object> data = new HashMap<>();
         data.put(Config.TOPOLOGY_SUBMITTER_USER, user);
-        data.put("worker-id", _workerId);
+        data.put("worker-id", workerId);
 
         Set<String> logsGroups = new HashSet<>();
-        if (_topoConf.get(DaemonConfig.LOGS_GROUPS) != null) {
-            List<String> groups = (List<String>) _topoConf.get(DaemonConfig.LOGS_GROUPS);
-            for (String group : groups) {
-                logsGroups.add(group);
-            }
+        if (topoConf.get(DaemonConfig.LOGS_GROUPS) != null) {
+            List<String> groups = ObjectReader.getStrings(topoConf.get(DaemonConfig.LOGS_GROUPS));
+            logsGroups.addAll(groups);
         }
-        if (_topoConf.get(Config.TOPOLOGY_GROUPS) != null) {
-            List<String> topGroups = (List<String>) _topoConf.get(Config.TOPOLOGY_GROUPS);
+        if (topoConf.get(Config.TOPOLOGY_GROUPS) != null) {
+            List<String> topGroups = ObjectReader.getStrings(topoConf.get(Config.TOPOLOGY_GROUPS));
             logsGroups.addAll(topGroups);
         }
         data.put(DaemonConfig.LOGS_GROUPS, logsGroups.toArray());
 
         Set<String> logsUsers = new HashSet<>();
-        if (_topoConf.get(DaemonConfig.LOGS_USERS) != null) {
-            List<String> logUsers = (List<String>) _topoConf.get(DaemonConfig.LOGS_USERS);
-            for (String logUser : logUsers) {
-                logsUsers.add(logUser);
-            }
+        if (topoConf.get(DaemonConfig.LOGS_USERS) != null) {
+            List<String> logUsers = ObjectReader.getStrings(topoConf.get(DaemonConfig.LOGS_USERS));
+            logsUsers.addAll(logUsers);
         }
-        if (_topoConf.get(Config.TOPOLOGY_USERS) != null) {
-            List<String> topUsers = (List<String>) _topoConf.get(Config.TOPOLOGY_USERS);
-            for (String logUser : topUsers) {
-                logsUsers.add(logUser);
-            }
+        if (topoConf.get(Config.TOPOLOGY_USERS) != null) {
+            List<String> topUsers = ObjectReader.getStrings(topoConf.get(Config.TOPOLOGY_USERS));
+            logsUsers.addAll(topUsers);
         }
         data.put(DaemonConfig.LOGS_USERS, logsUsers.toArray());
 
-        File file = ServerConfigUtils.getLogMetaDataFile(_conf, _topologyId, _port);
+        if (topoConf.get(Config.TOPOLOGY_WORKER_TIMEOUT_SECS) != null) {
+            int topoTimeout = ObjectReader.getInt(topoConf.get(Config.TOPOLOGY_WORKER_TIMEOUT_SECS));
+            int defaultWorkerTimeout = ObjectReader.getInt(conf.get(Config.SUPERVISOR_WORKER_TIMEOUT_SECS));
+            topoTimeout = Math.max(topoTimeout, defaultWorkerTimeout);
+            data.put(Config.TOPOLOGY_WORKER_TIMEOUT_SECS, topoTimeout);
+        }
+
+        File file = ServerConfigUtils.getLogMetaDataFile(conf, topologyId, port);
 
         Yaml yaml = new Yaml();
-        try (Writer writer = _ops.getWriter(file)) {
+        try (Writer writer = ops.getWriter(file)) {
             yaml.dump(data, writer);
         }
     }
@@ -453,13 +338,13 @@ public abstract class Container implements Killable {
      * @throws IOException on any error
      */
     protected void createArtifactsLink() throws IOException {
-        _type.assertFull();
-        if (!_symlinksDisabled) {
-            File workerDir = new File(ConfigUtils.workerRoot(_conf, _workerId));
-            File topoDir = new File(ConfigUtils.workerArtifactsRoot(_conf, _topologyId, _port));
-            if (_ops.fileExists(workerDir)) {
-                LOG.debug("Creating symlinks for worker-id: {} topology-id: {} to its port artifacts directory", _workerId, _topologyId);
-                _ops.createSymlink(new File(workerDir, "artifacts"), topoDir);
+        type.assertFull();
+        if (!symlinksDisabled) {
+            File workerDir = new File(ConfigUtils.workerRoot(conf, workerId));
+            File topoDir = new File(ConfigUtils.workerArtifactsRoot(conf, topologyId, port));
+            if (ops.fileExists(workerDir)) {
+                LOG.debug("Creating symlinks for worker-id: {} topology-id: {} to its port artifacts directory", workerId, topologyId);
+                ops.createSymlink(new File(ConfigUtils.workerArtifactsSymlink(conf, workerId)), topoDir);
             }
         }
     }
@@ -470,12 +355,12 @@ public abstract class Container implements Killable {
      * @throws IOException on any error.
      */
     protected void createBlobstoreLinks() throws IOException {
-        _type.assertFull();
-        String stormRoot = ConfigUtils.supervisorStormDistRoot(_conf, _topologyId);
-        String workerRoot = ConfigUtils.workerRoot(_conf, _workerId);
+        type.assertFull();
+        String stormRoot = ConfigUtils.supervisorStormDistRoot(conf, topologyId);
+        String workerRoot = ConfigUtils.workerRoot(conf, workerId);
 
         @SuppressWarnings("unchecked")
-        Map<String, Map<String, Object>> blobstoreMap = (Map<String, Map<String, Object>>) _topoConf.get(Config.TOPOLOGY_BLOBSTORE_MAP);
+        Map<String, Map<String, Object>> blobstoreMap = (Map<String, Map<String, Object>>) topoConf.get(Config.TOPOLOGY_BLOBSTORE_MAP);
         List<String> blobFileNames = new ArrayList<>();
         if (blobstoreMap != null) {
             for (Map.Entry<String, Map<String, Object>> entry : blobstoreMap.entrySet()) {
@@ -497,18 +382,18 @@ public abstract class Container implements Killable {
         }
         resourceFileNames.addAll(blobFileNames);
 
-        if (!_symlinksDisabled) {
-            LOG.info("Creating symlinks for worker-id: {} storm-id: {} for files({}): {}", _workerId, _topologyId, resourceFileNames.size(),
-                     resourceFileNames);
+        if (!symlinksDisabled) {
+            LOG.info("Creating symlinks for worker-id: {} storm-id: {} for files({}): {}", workerId, topologyId, resourceFileNames.size(),
+                resourceFileNames);
             if (targetResourcesDir.exists()) {
-                _ops.createSymlink(new File(workerRoot, ServerConfigUtils.RESOURCES_SUBDIR), targetResourcesDir);
+                ops.createSymlink(new File(workerRoot, ServerConfigUtils.RESOURCES_SUBDIR), targetResourcesDir);
             } else {
-                LOG.info("Topology jar for worker-id: {} storm-id: {} does not contain re sources directory {}.", _workerId, _topologyId,
-                         targetResourcesDir.toString());
+                LOG.info("Topology jar for worker-id: {} storm-id: {} does not contain re sources directory {}.", workerId, topologyId,
+                    targetResourcesDir.toString());
             }
             for (String fileName : blobFileNames) {
-                _ops.createSymlink(new File(workerRoot, fileName),
-                                   new File(stormRoot, fileName));
+                ops.createSymlink(new File(workerRoot, fileName),
+                    new File(stormRoot, fileName));
             }
         } else if (blobFileNames.size() > 0) {
             LOG.warn("Symlinks are disabled, no symlinks created for blobs {}", blobFileNames);
@@ -516,68 +401,55 @@ public abstract class Container implements Killable {
     }
 
     /**
-     * @return all of the pids that are a part of this container.
-     */
-    protected Set<Long> getAllPids() throws IOException {
-        Set<Long> ret = new HashSet<>();
-        for (String listing : ConfigUtils.readDirContents(ConfigUtils.workerPidsRoot(_conf, _workerId))) {
-            ret.add(Long.valueOf(listing));
-        }
-
-        if (_resourceIsolationManager != null) {
-            Set<Long> morePids = _resourceIsolationManager.getRunningPids(_workerId);
-            assert (morePids != null);
-            ret.addAll(morePids);
-        }
-
-        return ret;
-    }
-
-    /**
+     * Get the user of the worker.
      * @return the user that some operations should be done as.
-     *
      * @throws IOException on any error
      */
     protected String getWorkerUser() throws IOException {
-        LOG.info("GET worker-user for {}", _workerId);
-        File file = new File(ConfigUtils.workerUserFile(_conf, _workerId));
-
-        if (_ops.fileExists(file)) {
-            return _ops.slurpString(file).trim();
-        } else if (_assignment != null && _assignment.is_set_owner()) {
-            return _assignment.get_owner();
+        if (cachedUser != null) {
+            return cachedUser;
         }
-        if (ConfigUtils.isLocalMode(_conf)) {
-            return System.getProperty("user.name");
-        } else {
-            File f = new File(ConfigUtils.workerArtifactsRoot(_conf));
-            if (f.exists()) {
-                return Files.getOwner(f.toPath()).getName();
+
+        LOG.info("GET worker-user for {}", workerId);
+        File file = new File(ConfigUtils.workerUserFile(conf, workerId));
+        if (ops.fileExists(file)) {
+            cachedUser = ops.slurpString(file).trim();
+            if (!StringUtils.isBlank(cachedUser)) {
+                return cachedUser;
             }
-            throw new IllegalStateException("Could not recover the user for " + _workerId);
         }
-    }
 
-    /**
-     * Returns the user that the worker process is running as.
-     *
-     * The default behavior is to launch the worker as the user supervisor is running as (e.g. 'storm')
-     *
-     * @return the user that the worker process is running as.
-     */
-    protected String getRunWorkerAsUser() {
-        return System.getProperty("user.name");
+        if (assignment != null && assignment.is_set_owner()) {
+            cachedUser = assignment.get_owner();
+            if (!StringUtils.isBlank(cachedUser)) {
+                return cachedUser;
+            }
+        }
+
+        if (ConfigUtils.isLocalMode(conf)) {
+            cachedUser = System.getProperty("user.name");
+            return cachedUser;
+        } else {
+            File f = new File(ConfigUtils.workerArtifactsRoot(conf));
+            if (f.exists()) {
+                cachedUser = Files.getOwner(f.toPath()).getName();
+                if (!StringUtils.isBlank(cachedUser)) {
+                    return cachedUser;
+                }
+            }
+            throw new IllegalStateException("Could not recover the user for " + workerId);
+        }
     }
 
     protected void saveWorkerUser(String user) throws IOException {
-        _type.assertFull();
-        LOG.info("SET worker-user {} {}", _workerId, user);
-        _ops.dump(new File(ConfigUtils.workerUserFile(_conf, _workerId)), user);
+        type.assertFull();
+        LOG.info("SET worker-user {} {}", workerId, user);
+        ops.dump(new File(ConfigUtils.workerUserFile(conf, workerId)), user);
     }
 
     protected void deleteSavedWorkerUser() throws IOException {
-        LOG.info("REMOVE worker-user {}", _workerId);
-        _ops.deleteIfExists(new File(ConfigUtils.workerUserFile(_conf, _workerId)));
+        LOG.info("REMOVE worker-user {}", workerId);
+        ops.deleteIfExists(new File(ConfigUtils.workerUserFile(conf, workerId)));
     }
 
     /**
@@ -587,28 +459,23 @@ public abstract class Container implements Killable {
      * @throws IOException on any error
      */
     public void cleanUpForRestart() throws IOException {
-        LOG.info("Cleaning up {}:{}", _supervisorId, _workerId);
-        Set<Long> pids = getAllPids();
+        LOG.info("Cleaning up {}:{}", supervisorId, workerId);
         String user = getWorkerUser();
 
-        for (Long pid : pids) {
-            File path = new File(ConfigUtils.workerPidPath(_conf, _workerId, pid));
-            _ops.deleteIfExists(path, user, _workerId);
-        }
-
         //clean up for resource isolation if enabled
-        if (_resourceIsolationManager != null) {
-            _resourceIsolationManager.releaseResourcesForWorker(_workerId);
+        if (resourceIsolationManager != null) {
+            resourceIsolationManager.releaseResourcesForWorker(workerId);
+            resourceIsolationManager.cleanup(user, workerId, port);
         }
 
         //Always make sure to clean up everything else before worker directory
         //is removed since that is what is going to trigger the retry for cleanup
-        _ops.deleteIfExists(new File(ConfigUtils.workerHeartbeatsRoot(_conf, _workerId)), user, _workerId);
-        _ops.deleteIfExists(new File(ConfigUtils.workerPidsRoot(_conf, _workerId)), user, _workerId);
-        _ops.deleteIfExists(new File(ConfigUtils.workerTmpRoot(_conf, _workerId)), user, _workerId);
-        _ops.deleteIfExists(new File(ConfigUtils.workerRoot(_conf, _workerId)), user, _workerId);
+        ops.deleteIfExists(new File(ConfigUtils.workerHeartbeatsRoot(conf, workerId)), user, workerId);
+        ops.deleteIfExists(new File(ConfigUtils.workerPidsRoot(conf, workerId)), user, workerId);
+        ops.deleteIfExists(new File(ConfigUtils.workerTmpRoot(conf, workerId)), user, workerId);
+        ops.deleteIfExists(new File(ConfigUtils.workerRoot(conf, workerId)), user, workerId);
         deleteSavedWorkerUser();
-        _workerId = null;
+        workerId = null;
     }
 
     /**
@@ -623,11 +490,11 @@ public abstract class Container implements Killable {
     }
 
     protected void updateMemoryAccounting() {
-        _type.assertFull();
+        type.assertFull();
         long used = getMemoryUsageMb();
         long reserved = getMemoryReservationMb();
-        _usedMemory.put(_port, new TopoAndMemory(_topologyId, used));
-        _reservedMemory.put(_port, new TopoAndMemory(_topologyId, reserved));
+        containerMemoryTracker.setUsedMemoryMb(port, topologyId, used);
+        containerMemoryTracker.setReservedMemoryMb(port, topologyId, reserved);
     }
 
     /**
@@ -635,12 +502,7 @@ public abstract class Container implements Killable {
      */
     public long getTotalTopologyMemoryUsed() {
         updateMemoryAccounting();
-        return _usedMemory
-            .values()
-            .stream()
-            .filter((topoAndMem) -> _topologyId.equals(topoAndMem.topoId))
-            .mapToLong((topoAndMem) -> topoAndMem.memory)
-            .sum();
+        return containerMemoryTracker.getUsedMemoryMb(topologyId);
     }
 
     /**
@@ -652,12 +514,7 @@ public abstract class Container implements Killable {
     public long getTotalTopologyMemoryReserved(LocalAssignment withUpdatedLimits) {
         updateMemoryAccounting();
         long ret =
-            _reservedMemory
-                .values()
-                .stream()
-                .filter((topoAndMem) -> _topologyId.equals(topoAndMem.topoId))
-                .mapToLong((topoAndMem) -> topoAndMem.memory)
-                .sum();
+            containerMemoryTracker.getReservedMemoryMb(topologyId);
         if (withUpdatedLimits.is_set_total_node_shared()) {
             ret += withUpdatedLimits.get_total_node_shared();
         }
@@ -668,11 +525,7 @@ public abstract class Container implements Killable {
      * Get the number of workers for this topology.
      */
     public long getTotalWorkersForThisTopology() {
-        return _usedMemory
-            .values()
-            .stream()
-            .filter((topoAndMem) -> _topologyId.equals(topoAndMem.topoId))
-            .count();
+        return containerMemoryTracker.getAssignedWorkerCount(topologyId);
     }
 
     /**
@@ -712,10 +565,10 @@ public abstract class Container implements Killable {
      * Run a profiling request.
      *
      * @param request the request to run
-     * @param stop    is this a stop request?
+     * @param stop is this a stop request?
      * @return true if it succeeded, else false
      *
-     * @throws IOException          on any error
+     * @throws IOException on any error
      * @throws InterruptedException if running the command is interrupted.
      */
     public abstract boolean runProfiling(ProfileRequest request, boolean stop) throws IOException, InterruptedException;
@@ -724,7 +577,7 @@ public abstract class Container implements Killable {
      * Get the id of the container or null if there is no worker id right now.
      */
     public String getWorkerId() {
-        return _workerId;
+        return workerId;
     }
 
     /**
@@ -732,7 +585,8 @@ public abstract class Container implements Killable {
      */
     void processMetrics(OnlyLatestExecutor<Integer> exec, WorkerMetricsProcessor processor) {
         try {
-            if (_usedMemory.get(_port) != null) {
+            Optional<Long> usedMemoryForPort = containerMemoryTracker.getUsedMemoryMb(port);
+            if (usedMemoryForPort.isPresent()) {
                 // Make sure we don't process too frequently.
                 long nextMetricProcessTime = this.lastMetricProcessTime + 60L * 1000L;
                 long currentTimeMsec = System.currentTimeMillis();
@@ -744,17 +598,19 @@ public abstract class Container implements Killable {
 
                 // create metric for memory
                 long timestamp = System.currentTimeMillis();
-                double value = _usedMemory.get(_port).memory;
-                WorkerMetricPoint workerMetric = new WorkerMetricPoint(MEMORY_USED_METRIC, timestamp, value, SYSTEM_COMPONENT_ID,
-                                                                       INVALID_EXECUTOR_ID, INVALID_STREAM_ID);
+                WorkerMetricPoint workerMetric = new WorkerMetricPoint(MEMORY_USED_METRIC,
+                        timestamp,
+                        usedMemoryForPort.get(),
+                        SYSTEM_COMPONENT_ID,
+                        INVALID_EXECUTOR_ID, INVALID_STREAM_ID);
 
                 WorkerMetricList metricList = new WorkerMetricList();
                 metricList.add_to_metrics(workerMetric);
-                WorkerMetrics metrics = new WorkerMetrics(_topologyId, _port, hostname, metricList);
+                WorkerMetrics metrics = new WorkerMetrics(topologyId, port, hostname, metricList);
 
-                exec.execute(_port, () -> {
+                exec.execute(port, () -> {
                     try {
-                        processor.processWorkerMetrics(_conf, metrics);
+                        processor.processWorkerMetrics(conf, metrics);
                     } catch (MetricException e) {
                         LOG.error("Failed to process metrics", e);
                     }
@@ -767,46 +623,31 @@ public abstract class Container implements Killable {
         }
     }
 
-    public static enum ContainerType {
+    public enum ContainerType {
         LAUNCH(false, false),
         RECOVER_FULL(true, false),
         RECOVER_PARTIAL(true, true);
 
-        private final boolean _recovery;
-        private final boolean _onlyKillable;
+        private final boolean recovery;
+        private final boolean onlyKillable;
 
         ContainerType(boolean recovery, boolean onlyKillable) {
-            _recovery = recovery;
-            _onlyKillable = onlyKillable;
+            this.recovery = recovery;
+            this.onlyKillable = onlyKillable;
         }
 
         public boolean isRecovery() {
-            return _recovery;
+            return recovery;
         }
 
         public void assertFull() {
-            if (_onlyKillable) {
+            if (onlyKillable) {
                 throw new IllegalStateException("Container is only Killable.");
             }
         }
 
         public boolean isOnlyKillable() {
-            return _onlyKillable;
-        }
-    }
-
-    private static class TopoAndMemory {
-        public final String topoId;
-        public final long memory;
-
-        public TopoAndMemory(String id, long mem) {
-            topoId = id;
-            memory = mem;
-        }
-
-        @Override
-        public String toString() {
-            return "{TOPO: " + topoId + " at " + memory + " MB}";
+            return onlyKillable;
         }
     }
 }

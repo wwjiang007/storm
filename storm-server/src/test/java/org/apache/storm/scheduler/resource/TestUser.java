@@ -22,21 +22,35 @@ import org.apache.storm.scheduler.Topologies;
 import org.apache.storm.scheduler.TopologyDetails;
 import org.apache.storm.scheduler.WorkerSlot;
 import org.apache.storm.scheduler.resource.TestUtilsForResourceAwareScheduler.INimbusTest;
+import org.apache.storm.scheduler.resource.strategies.scheduling.DefaultResourceAwareStrategy;
 import org.apache.storm.utils.Time;
 import org.junit.Assert;
 import org.junit.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import static org.apache.storm.scheduler.resource.TestUtilsForResourceAwareScheduler.createClusterConfig;
 import static org.apache.storm.scheduler.resource.TestUtilsForResourceAwareScheduler.genSupervisors;
 import static org.apache.storm.scheduler.resource.TestUtilsForResourceAwareScheduler.genTopology;
 import static org.apache.storm.scheduler.resource.TestUtilsForResourceAwareScheduler.toDouble;
 import static org.apache.storm.scheduler.resource.TestUtilsForResourceAwareScheduler.userRes;
 import static org.apache.storm.scheduler.resource.TestUtilsForResourceAwareScheduler.userResourcePool;
 
+import org.apache.storm.metric.StormMetricsRegistry;
+import org.apache.storm.scheduler.resource.normalization.ResourceMetrics;
+
 public class TestUser {
     private static final Logger LOG = LoggerFactory.getLogger(TestUser.class);
+
+    protected Class getDefaultResourceAwareStrategyClass() {
+        return DefaultResourceAwareStrategy.class;
+    }
+
+    private Config createClusterConfig(double compPcore, double compOnHeap, double compOffHeap,
+                                       Map<String, Map<String, Number>> pools) {
+        Config config = TestUtilsForResourceAwareScheduler.createClusterConfig(compPcore, compOnHeap, compOffHeap, pools);
+        config.put(Config.TOPOLOGY_SCHEDULER_STRATEGY, getDefaultResourceAwareStrategyClass().getName());
+        return config;
+    }
 
     @Test
     public void testResourcePoolUtilization() {
@@ -50,7 +64,7 @@ public class TestUser {
         TopologyDetails topo1 = genTopology("topo-1", config, 1, 1, 2, 1, Time.currentTimeSecs() - 24, 9, "user1");
         Topologies topologies = new Topologies(topo1);
 
-        Cluster cluster = new Cluster(iNimbus, supMap, new HashMap<>(), topologies, config);
+        Cluster cluster = new Cluster(iNimbus, new ResourceMetrics(new StormMetricsRegistry()), supMap, new HashMap<>(), topologies, config);
         User user1 = new User("user1", toDouble(resourceUserPool.get("user1")));
         WorkerSlot slot = cluster.getAvailableSlots().get(0);
         cluster.assign(slot, topo1.getId(), topo1.getExecutors());

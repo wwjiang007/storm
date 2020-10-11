@@ -19,8 +19,9 @@
 package org.apache.storm.daemon.ui.resources;
 
 import com.codahale.metrics.Meter;
-import java.net.URLDecoder;
+import java.io.UnsupportedEncodingException;
 import java.util.Map;
+import javax.inject.Inject;
 import javax.servlet.http.HttpServletRequest;
 import javax.ws.rs.Consumes;
 import javax.ws.rs.DefaultValue;
@@ -37,6 +38,7 @@ import javax.ws.rs.core.SecurityContext;
 import org.apache.storm.daemon.ui.UIHelpers;
 import org.apache.storm.metric.StormMetricsRegistry;
 import org.apache.storm.thrift.TException;
+import org.apache.storm.utils.ConfigUtils;
 import org.apache.storm.utils.NimbusClient;
 import org.apache.storm.utils.Utils;
 import org.json.simple.JSONValue;
@@ -57,65 +59,50 @@ public class StormApiResource {
     @Context
     private HttpServletRequest servletRequest;
 
-    public static Map<String, Object> config = Utils.readStormConfig();
+    public static Map<String, Object> config = ConfigUtils.readStormConfig();
 
-    public static Meter clusterConfigurationRequestMeter =
-            StormMetricsRegistry.registerMeter("ui:num-cluster-configuration-http-requests");
+    private final Meter clusterConfigurationRequestMeter;
+    private final Meter clusterSummaryRequestMeter;
+    private final Meter nimbusSummaryRequestMeter;
+    private final Meter supervisorRequestMeter;
+    private final Meter supervisorSummaryRequestMeter;
+    private final Meter allTopologiesSummaryRequestMeter;
+    private final Meter topologyPageRequestMeter;
+    private final Meter topologyMetricRequestMeter;
+    private final Meter buildVisualizationRequestMeter;
+    private final Meter mkVisualizationDataRequestMeter;
+    private final Meter componentPageRequestMeter;
+    private final Meter logConfigRequestMeter;
+    private final Meter activateTopologyRequestMeter;
+    private final Meter deactivateTopologyRequestMeter;
+    private final Meter debugTopologyRequestMeter;
+    private final Meter componentOpResponseRequestMeter;
+    private final Meter topologyOpResponseMeter;
+    private final Meter topologyLagRequestMeter;
+    private final Meter getOwnerResourceSummariesMeter;
 
-    public static Meter clusterSummaryRequestMeter =
-            StormMetricsRegistry.registerMeter("ui:num-cluster-summary-http-requests");
-
-    public static Meter nimbusSummaryRequestMeter =
-            StormMetricsRegistry.registerMeter("ui:num-nimbus-summary-http-requests");
-
-    public static Meter supervisorRequestMeter =
-            StormMetricsRegistry.registerMeter("ui:num-supervisor-http-requests");
-
-    public static Meter supervisorSummaryRequestMeter =
-            StormMetricsRegistry.registerMeter("ui:num-supervisor-summary-http-requests");
-
-    public static Meter allTopologiesSummaryRequestMeter =
-            StormMetricsRegistry.registerMeter("ui:num-all-topologies-summary-http-requests");
-
-    public static Meter topologyPageRequestMeter =
-            StormMetricsRegistry.registerMeter("ui:num-topology-page-http-requests");
-
-    public static Meter topologyMetricRequestMeter =
-            StormMetricsRegistry.registerMeter("ui:num-topology-metric-http-requests");
-
-    public static Meter buildVisualizationRequestMeter =
-            StormMetricsRegistry.registerMeter("ui:num-build-visualization-http-requests");
-
-    public static Meter mkVisualizationDataRequestMeter =
-            StormMetricsRegistry.registerMeter("ui:num-mk-visualization-data-http-requests");
-
-    public static Meter componentPageRequestMeter =
-            StormMetricsRegistry.registerMeter("ui:num-component-page-http-requests");
-
-    public static Meter logConfigRequestMeter =
-            StormMetricsRegistry.registerMeter("ui:num-log-config-http-requests");
-
-    public static Meter activateTopologyRequestMeter =
-            StormMetricsRegistry.registerMeter("ui:num-activate-topology-http-requests");
-
-    public static Meter deactivateTopologyRequestMeter =
-            StormMetricsRegistry.registerMeter("ui:num-deactivate-topology-http-requests");
-
-    public static Meter debugTopologyRequestMeter =
-            StormMetricsRegistry.registerMeter("ui:num-debug-topology-http-requests");
-
-    public static Meter componentOpResponseRequestMeter =
-            StormMetricsRegistry.registerMeter("ui:num-component-op-response-http-requests");
-
-    public static Meter topologyOpResponseMeter =
-            StormMetricsRegistry.registerMeter("ui:num-topology-op-response-http-requests");
-
-    public static Meter topologyLagRequestMeter =
-            StormMetricsRegistry.registerMeter("ui:num-topology-lag-http-requests");
-
-    public static Meter getOwnerResourceSummariesMeter =
-            StormMetricsRegistry.registerMeter("ui:num-get-owner-resource-summaries-http-request");
-
+    @Inject
+    public StormApiResource(StormMetricsRegistry metricsRegistry) {
+        this.clusterConfigurationRequestMeter = metricsRegistry.registerMeter("ui:num-cluster-configuration-http-requests");
+        this.clusterSummaryRequestMeter = metricsRegistry.registerMeter("ui:num-cluster-summary-http-requests");
+        this.nimbusSummaryRequestMeter = metricsRegistry.registerMeter("ui:num-nimbus-summary-http-requests");
+        this.supervisorRequestMeter = metricsRegistry.registerMeter("ui:num-supervisor-http-requests");
+        this.supervisorSummaryRequestMeter = metricsRegistry.registerMeter("ui:num-supervisor-summary-http-requests");
+        this.allTopologiesSummaryRequestMeter = metricsRegistry.registerMeter("ui:num-all-topologies-summary-http-requests");
+        this.topologyPageRequestMeter = metricsRegistry.registerMeter("ui:num-topology-page-http-requests");
+        this.topologyMetricRequestMeter = metricsRegistry.registerMeter("ui:num-topology-metric-http-requests");
+        this.buildVisualizationRequestMeter = metricsRegistry.registerMeter("ui:num-build-visualization-http-requests");
+        this.mkVisualizationDataRequestMeter = metricsRegistry.registerMeter("ui:num-mk-visualization-data-http-requests");
+        this.componentPageRequestMeter = metricsRegistry.registerMeter("ui:num-component-page-http-requests");
+        this.logConfigRequestMeter = metricsRegistry.registerMeter("ui:num-log-config-http-requests");
+        this.activateTopologyRequestMeter = metricsRegistry.registerMeter("ui:num-activate-topology-http-requests");
+        this.deactivateTopologyRequestMeter = metricsRegistry.registerMeter("ui:num-deactivate-topology-http-requests");
+        this.debugTopologyRequestMeter = metricsRegistry.registerMeter("ui:num-debug-topology-http-requests");
+        this.componentOpResponseRequestMeter = metricsRegistry.registerMeter("ui:num-component-op-response-http-requests");
+        this.topologyOpResponseMeter = metricsRegistry.registerMeter("ui:num-topology-op-response-http-requests");
+        this.topologyLagRequestMeter = metricsRegistry.registerMeter("ui:num-topology-lag-http-requests");
+        this.getOwnerResourceSummariesMeter = metricsRegistry.registerMeter("ui:num-get-owner-resource-summaries-http-request");
+    }
 
     /**
      * /api/v1/cluster/configuration -> nimbus configuration.
@@ -227,7 +214,7 @@ public class StormApiResource {
     }
 
     /**
-     * /api/v1/supervisor/summary -> topo history.
+     * /api/v1/supervisor/summary -> supervisor summary.
      */
     @GET
     @Path("/supervisor/summary")
@@ -283,7 +270,7 @@ public class StormApiResource {
         try (NimbusClient nimbusClient = NimbusClient.getConfiguredClient(config)) {
             return UIHelpers.makeStandardResponse(
                     UIHelpers.getAllTopologiesSummary(
-                            nimbusClient.getClient().getClusterInfo().get_topologies(),
+                            nimbusClient.getClient().getTopologySummaries(),
                             config
                     ),
                     callback
@@ -323,14 +310,14 @@ public class StormApiResource {
     @AuthNimbusOp(value = "getTopology", needsTopoId = true)
     @Produces("application/json")
     public Response getTopologyWorkers(@PathParam("id") String id,
-                                       @QueryParam(callbackParameterName) String callback) throws TException {
+        @QueryParam(callbackParameterName) String callback) throws TException {
         try (NimbusClient nimbusClient = NimbusClient.getConfiguredClient(config)) {
-            id = URLDecoder.decode(id);
+            id = Utils.urlDecodeUtf8(id);
             return UIHelpers.makeStandardResponse(
-                    UIHelpers.getTopologyWorkers(
-                            nimbusClient.getClient().getTopologyInfo(id), config
-                    ),
-                    callback
+                UIHelpers.getTopologyWorkers(
+                    nimbusClient.getClient().getTopologyInfo(id), config
+                ),
+                callback
             );
         }
     }
@@ -415,11 +402,14 @@ public class StormApiResource {
                     UIHelpers.getVisualizationData(nimbusClient.getClient(), window, id, sys),
                     callback
             );
+        } catch (RuntimeException e) {
+            LOG.error("Failure getting topology visualization", e);
+            throw e;
         }
     }
 
     /**
-     * /api/v1//topology/:id/component/:component -> component.
+     * /api/v1/topology/:id/component/:component -> component.
      */
     @GET
     @Path("/topology/{id}/component/{component}")
@@ -473,10 +463,6 @@ public class StormApiResource {
     public Response putTopologyLogconfig(@PathParam("id") String id, String body,
                                          @QueryParam(callbackParameterName) String callback) throws TException {
         topologyOpResponseMeter.mark();
-        LOG.info("HELLISh");
-        LOG.info(body);
-        LOG.info(id);
-        LOG.info(callback);
         try (NimbusClient nimbusClient = NimbusClient.getConfiguredClient(config)) {
             return UIHelpers.makeStandardResponse(
                     UIHelpers.putTopologyLogLevel(nimbusClient.getClient(),
@@ -597,20 +583,20 @@ public class StormApiResource {
     @AuthNimbusOp(value = "killTopology", needsTopoId = true)
     @Produces("application/json")
     public Response putTopologyKill(
-            @PathParam("id") String id,
-            @PathParam("wait-time") String waitTime,
-            @QueryParam(callbackParameterName) String callback) throws TException {
-            topologyOpResponseMeter.mark();
+        @PathParam("id") String id,
+        @PathParam("wait-time") String waitTime,
+        @QueryParam(callbackParameterName) String callback) throws TException {
+        topologyOpResponseMeter.mark();
         try (NimbusClient nimbusClient = NimbusClient.getConfiguredClient(config)) {
             return UIHelpers.makeStandardResponse(
-                    UIHelpers.putTopologyKill(nimbusClient.getClient(), id, waitTime),
-                    callback
+                UIHelpers.putTopologyKill(nimbusClient.getClient(), id, waitTime),
+                callback
             );
         }
     }
 
     /**
-     * /api/v1/topology/:id/profiling/start/:host-port/:timeout -> profiling tart.
+     * /api/v1/topology/:id/profiling/start/:host-port/:timeout -> profiling start.
      */
     @GET
     @Path("/topology/{id}/profiling/start/{host-port}/{timeout}")
@@ -629,58 +615,55 @@ public class StormApiResource {
     }
 
     /**
-     * /api/v1/topology/:id/profiling/stop/:host-port/:timeout -> profiling stop.
+     * /api/v1/topology/:id/profiling/stop/:host-port -> profiling stop.
      */
     @GET
-    @Path("/topology/{id}/profiling/stop/{host-port}/{timeout}")
+    @Path("/topology/{id}/profiling/stop/{host-port}")
     @AuthNimbusOp(value = "setWorkerProfiler", needsTopoId = true)
     @Produces("application/json")
     public Response getTopologyProfilingStop(@PathParam("id") String id,
                                              @PathParam("host-port") String hostPort,
-                                             @PathParam("timeout") String timeout,
                                              @QueryParam(callbackParameterName) String callback) throws TException {
         try (NimbusClient nimbusClient = NimbusClient.getConfiguredClient(config)) {
             return UIHelpers.makeStandardResponse(
-                    UIHelpers.getTopologyProfilingStop(nimbusClient.getClient(), id, hostPort, timeout, config),
+                    UIHelpers.getTopologyProfilingStop(nimbusClient.getClient(), id, hostPort, config),
                     callback
             );
         }
     }
 
     /**
-     * /api/v1/topology/:id/profiling/dumpprofile/:host-port/:timeout -> dump profile.
+     * /api/v1/topology/:id/profiling/dumpprofile/:host-port -> dump profile.
      */
     @GET
-    @Path("/topology/{id}/profiling/dumpprofile/{host-port}/{timeout}")
+    @Path("/topology/{id}/profiling/dumpprofile/{host-port}")
     @AuthNimbusOp(value = "setWorkerProfiler", needsTopoId = true)
     @Produces("application/json")
     public Response getTopologyProfilingDumpProfile(@PathParam("id") String id,
                                                     @PathParam("host-port") String hostPort,
-                                                    @PathParam("timeout") String timeout,
                                                     @QueryParam(callbackParameterName) String callback) throws TException {
         try (NimbusClient nimbusClient = NimbusClient.getConfiguredClient(config)) {
             return UIHelpers.makeStandardResponse(
-                    UIHelpers.getTopologyProfilingDump(nimbusClient.getClient(), id, hostPort, timeout, config),
+                    UIHelpers.getTopologyProfilingDump(nimbusClient.getClient(), id, hostPort, config),
                     callback
             );
         }
     }
 
     /**
-     * /api/v1/topology/:id/profiling/restartworker/:host-port/:timeout -> restart worker.
+     * /api/v1/topology/:id/profiling/dumpjstack/:host-port -> dump jstack.
      */
     @GET
-    @Path("/topology/{id}/profiling/restartworker/{host-port}/{timeout}")
+    @Path("/topology/{id}/profiling/dumpjstack/{host-port}")
     @AuthNimbusOp(value = "setWorkerProfiler", needsTopoId = true)
     @Produces("application/json")
-    public Response getTopologyProfilingRestartWorker(@PathParam("id") String id,
-                                                      @PathParam("host-port") String hostPort,
-                                                      @PathParam("timeout") String timeout,
-                                                      @QueryParam(callbackParameterName) String callback) throws TException {
+    public Response getTopologyProfilingDumpJstack(@PathParam("id") String id,
+                                                   @PathParam("host-port") String hostPort,
+                                                   @QueryParam(callbackParameterName) String callback) throws TException {
         try (NimbusClient nimbusClient = NimbusClient.getConfiguredClient(config)) {
             return UIHelpers.makeStandardResponse(
-                    UIHelpers.getTopologyProfilingRestartWorker(
-                            nimbusClient.getClient(), id, hostPort, timeout, config
+                    UIHelpers.getTopologyProfilingDumpJstack(
+                            nimbusClient.getClient(), id, hostPort, config
                     ),
                     callback
             );
@@ -688,20 +671,39 @@ public class StormApiResource {
     }
 
     /**
-     * /api/v1/topology/:id/profiling/dumpheap/:host-port/:timeout -> dump heap.
+     * /api/v1/topology/:id/profiling/restartworker/:host-port -> restart worker.
      */
     @GET
-    @Path("/topology/{id}/profiling/dumpheap/{host-port}/{timeout}")
+    @Path("/topology/{id}/profiling/restartworker/{host-port}")
+    @AuthNimbusOp(value = "setWorkerProfiler", needsTopoId = true)
+    @Produces("application/json")
+    public Response getTopologyProfilingRestartWorker(@PathParam("id") String id,
+                                                      @PathParam("host-port") String hostPort,
+                                                      @QueryParam(callbackParameterName) String callback) throws TException {
+        try (NimbusClient nimbusClient = NimbusClient.getConfiguredClient(config)) {
+            return UIHelpers.makeStandardResponse(
+                    UIHelpers.getTopologyProfilingRestartWorker(
+                            nimbusClient.getClient(), id, hostPort, config
+                    ),
+                    callback
+            );
+        }
+    }
+
+    /**
+     * /api/v1/topology/:id/profiling/dumpheap/:host-port -> dump heap.
+     */
+    @GET
+    @Path("/topology/{id}/profiling/dumpheap/{host-port}")
     @AuthNimbusOp(value = "setWorkerProfiler", needsTopoId = true)
     @Produces("application/json")
     public Response getTopologyProfilingDumpheap(@PathParam("id") String id,
                                                  @PathParam("host-port") String hostPort,
-                                                 @PathParam("timeout") String timeout,
                                                  @QueryParam(callbackParameterName) String callback) throws TException {
         try (NimbusClient nimbusClient = NimbusClient.getConfiguredClient(config)) {
             return UIHelpers.makeStandardResponse(
                     UIHelpers.getTopologyProfilingDumpHeap(
-                            nimbusClient.getClient(), id, hostPort, timeout, config
+                            nimbusClient.getClient(), id, hostPort, config
                     ),
                     callback
             );

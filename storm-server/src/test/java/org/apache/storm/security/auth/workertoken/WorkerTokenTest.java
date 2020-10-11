@@ -81,10 +81,11 @@ public class WorkerTokenTest {
             assertEquals(ONE_DAY_MILLIS, info.get_expirationTimeMillis());
             assertEquals(versionNumber, info.get_secretVersion());
 
-            //Verify the signature...
-            WorkerTokenAuthorizer wta = new WorkerTokenAuthorizer(type, mockState);
-            byte[] signature = wta.getSignedPasswordFor(wt.get_info(), info);
-            assertArrayEquals(wt.get_signature(), signature);
+            try (WorkerTokenAuthorizer wta = new WorkerTokenAuthorizer(type, mockState)) {
+                //Verify the signature...
+                byte[] signature = wta.getSignedPasswordFor(wt.get_info(), info);
+                assertArrayEquals(wt.get_signature(), signature);
+            }
         }
     }
 
@@ -135,25 +136,20 @@ public class WorkerTokenTest {
             //Expire the token
             Time.advanceTime(ONE_DAY_MILLIS + 1);
 
-            //Verify the signature...
-            WorkerTokenAuthorizer wta = new WorkerTokenAuthorizer(type, mockState);
-            try {
-                wta.getSignedPasswordFor(wt.get_info(), info);
-                fail("Expected an expired token to not be signed!!!");
-            } catch (IllegalArgumentException ia) {
-                //What we want...
+            try (WorkerTokenAuthorizer wta = new WorkerTokenAuthorizer(type, mockState)) {
+                try {
+                    //Verify the signature...
+                    wta.getSignedPasswordFor(wt.get_info(), info);
+                    fail("Expected an expired token to not be signed!!!");
+                } catch (IllegalArgumentException ia) {
+                    //What we want...
+                }
             }
-        }
-    }
 
-    @Test
-    public void testRenewalTimeDefault() {
-        try (Time.SimulatedTime sim = new Time.SimulatedTime()) {
-            IStormClusterState mockState = mock(IStormClusterState.class);
-            Map<String, Object> conf = new HashMap<>();
-            WorkerTokenManager wtm = new WorkerTokenManager(conf, mockState);
-
-            assertEquals(ONE_DAY_MILLIS/2, wtm.getMaxExpirationTimeForRenewal());
+            //Verify if WorkerTokenManager recognizes the expired WorkerToken.
+            Map<String, String> creds = new HashMap<>();
+            ClientAuthUtils.setWorkerToken(creds, wt);
+            assertTrue("Expired WorkerToken should be eligible for renewal", wtm.shouldRenewWorkerToken(creds, type));
         }
     }
 }

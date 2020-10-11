@@ -12,10 +12,10 @@
 
 package org.apache.storm.daemon.supervisor;
 
-import com.codahale.metrics.Meter;
-import com.codahale.metrics.Timer;
+import com.google.common.annotations.VisibleForTesting;
 import java.io.IOException;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -38,14 +38,13 @@ import org.apache.storm.generated.LSWorkerHeartbeat;
 import org.apache.storm.generated.LocalAssignment;
 import org.apache.storm.generated.ProfileAction;
 import org.apache.storm.generated.ProfileRequest;
+import org.apache.storm.generated.WorkerResources;
 import org.apache.storm.localizer.AsyncLocalizer;
 import org.apache.storm.localizer.BlobChangingCallback;
 import org.apache.storm.localizer.GoodToGo;
 import org.apache.storm.localizer.LocallyCachedBlob;
-import org.apache.storm.metric.StormMetricsRegistry;
 import org.apache.storm.metricstore.WorkerMetricsProcessor;
 import org.apache.storm.scheduler.ISupervisor;
-import org.apache.storm.shade.com.google.common.annotations.VisibleForTesting;
 import org.apache.storm.utils.EnumUtil;
 import org.apache.storm.utils.LocalState;
 import org.apache.storm.utils.ObjectReader;
@@ -56,10 +55,8 @@ import org.slf4j.LoggerFactory;
 
 public class Slot extends Thread implements AutoCloseable, BlobChangingCallback {
     private static final Logger LOG = LoggerFactory.getLogger(Slot.class);
-    private static final Meter numWorkersLaunched =
-        StormMetricsRegistry.registerMeter("supervisor:num-workers-launched");
 
-    private enum KillReason {
+    enum KillReason {
         ASSIGNMENT_CHANGED, BLOB_CHANGED, PROCESS_EXIT, MEMORY_VIOLATION, HB_TIMEOUT, HB_NULL;
 
         @Override
@@ -68,11 +65,6 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
         }
 
     }
-
-    private static final Map<KillReason, Meter> numWorkersKilledFor = EnumUtil.toEnumMap(KillReason.class,
-        killReason -> StormMetricsRegistry.registerMeter("supervisor:num-workers-killed-" + killReason.toString()));
-    private static final Timer workerLaunchDuration = StormMetricsRegistry.registerTimer(
-        "supervisor:worker-launch-duration");
 
     private static final long ONE_SEC_IN_NANO = TimeUnit.NANOSECONDS.convert(1, TimeUnit.SECONDS);
     private final AtomicReference<LocalAssignment> newAssignment = new AtomicReference<>();
@@ -90,10 +82,11 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
                 ContainerLauncher containerLauncher, String host,
                 int port, LocalState localState,
                 IStormClusterState clusterState,
-                ISupervisor iSupervisor,
+                ISupervisor supervisor,
                 AtomicReference<Map<Long, LocalAssignment>> cachedCurrentAssignments,
                 OnlyLatestExecutor<Integer> metricsExec,
-                WorkerMetricsProcessor metricsProcessor) throws Exception {
+                WorkerMetricsProcessor metricsProcessor,
+                SlotMetrics slotMetrics) throws Exception {
         super("SLOT_" + port);
         this.metricsExec = metricsExec;
         this.cachedCurrentAssignments = cachedCurrentAssignments;
@@ -101,15 +94,15 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
         this.staticState = new StaticState(localizer,
                 ObjectReader.getInt(conf.get(Config.SUPERVISOR_WORKER_TIMEOUT_SECS)) * 1000,
                 ObjectReader.getInt(conf.get(DaemonConfig.SUPERVISOR_WORKER_START_TIMEOUT_SECS)) * 1000,
-                ObjectReader.getInt(conf.get(DaemonConfig.SUPERVISOR_WORKER_SHUTDOWN_SLEEP_SECS)) * 1000,
+                ObjectReader.getInt(conf.get(Config.SUPERVISOR_WORKER_SHUTDOWN_SLEEP_SECS)) * 1000,
                 ObjectReader.getInt(conf.get(DaemonConfig.SUPERVISOR_MONITOR_FREQUENCY_SECS)) * 1000,
                 containerLauncher,
                 host,
                 port,
-                iSupervisor,
+                supervisor,
                 localState,
                 this,
-                metricsExec, metricsProcessor);
+                metricsExec, metricsProcessor, slotMetrics);
 
         LocalAssignment currentAssignment = null;
         Container container = null;
@@ -134,13 +127,10 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
                     }
                 } catch (ContainerRecoveryException e) {
                     //We could not recover container will be null.
+                    currentAssignment = null;
                 }
 
                 newAssignment = currentAssignment;
-                if (container == null) {
-                    currentAssignment = null;
-                    //Assigned something but it is not running
-                }
             }
         }
 
@@ -148,7 +138,7 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
         //if the current assignment is already running, new assignment will never be promoted to currAssignment,
         // because Timer is not being compared in #equals or #equivalent, meaning newAssignment always equals to currAssignment.
         // Therefore the timer in newAssignment won't be invoked
-        this.dynamicState = new DynamicState(currentAssignment, container, this.newAssignment.get());
+        this.dynamicState = new DynamicState(currentAssignment, container, this.newAssignment.get(), slotMetrics);
         if (MachineState.RUNNING == dynamicState.state) {
             //We are running so we should recover the blobs.
             staticState.localizer.recoverRunningTopology(currentAssignment, port, this);
@@ -161,7 +151,9 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
     //In some cases the new LocalAssignment may be equivalent to the old, but
     // It is not equal.  In those cases we want to update the current assignment to
     // be the same as the new assignment
+    //PRECONDITION: The new and current assignments must be equivalent
     private static DynamicState updateAssignmentIfNeeded(DynamicState dynamicState) {
+        assert equivalent(dynamicState.newAssignment, dynamicState.currentAssignment);
         if (dynamicState.newAssignment != null
             && !dynamicState.newAssignment.equals(dynamicState.currentAssignment)) {
             dynamicState =
@@ -184,31 +176,102 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
     }
 
     /**
-     * Decide the equivalence of two local assignments, ignoring the order of executors
-     * This is different from #equal method.
-     * @param a Local assignment A
-     * @param b Local assignment B
+     * This method compares WorkerResources while considering any resources are NULL to be 0.0
+     *
+     * @param first  WorkerResources A
+     * @param second WorkerResources B
+     * @return True if A and B are equivalent, treating the absent resources as 0.0
+     */
+    @VisibleForTesting
+    static boolean customWorkerResourcesEquality(WorkerResources first, WorkerResources second) {
+        if (first == null) {
+            return false;
+        }
+        if (first == second) {
+            return true;
+        }
+        if (first.equals(second)) {
+            return true;
+        }
+
+        if (first.get_cpu() != second.get_cpu()) {
+            return false;
+        }
+        if (first.get_mem_on_heap() != second.get_mem_on_heap()) {
+            return false;
+        }
+        if (first.get_mem_off_heap() != second.get_mem_off_heap()) {
+            return false;
+        }
+        if (first.get_shared_mem_off_heap() != second.get_shared_mem_off_heap()) {
+            return false;
+        }
+        if (first.get_shared_mem_on_heap() != second.get_shared_mem_on_heap()) {
+            return false;
+        }
+        if (!customResourceMapEquality(first.get_resources(), second.get_resources())) {
+            return false;
+        }
+        if (!customResourceMapEquality(first.get_shared_resources(), second.get_shared_resources())) {
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * This method compares Resource Maps while considering any resources are NULL to be 0.0
+     *
+     * @param firstMap  Resource Map A
+     * @param secondMap Resource Map B
+     * @return True if A and B are equivalent, treating the absent resources as 0.0
+     */
+    private static boolean customResourceMapEquality(Map<String, Double> firstMap, Map<String, Double> secondMap) {
+        if (firstMap == null && secondMap == null) {
+            return true;
+        }
+        if (firstMap == null) {
+            firstMap = new HashMap<>();
+        }
+        if (secondMap == null) {
+            secondMap = new HashMap<>();
+        }
+
+        Set<String> keys = new HashSet<>(firstMap.keySet());
+        keys.addAll(secondMap.keySet());
+        for (String key : keys) {
+            if (firstMap.getOrDefault(key, 0.0).doubleValue() != secondMap.getOrDefault(key, 0.0).doubleValue()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Decide the equivalence of two local assignments, ignoring the order of executors This is different from #equal method.
+     *
+     * @param first  Local assignment A
+     * @param second Local assignment B
      * @return True if A and B are equivalent, ignoring the order of the executors
      */
     @VisibleForTesting
-    static boolean equivalent(LocalAssignment a, LocalAssignment b) {
-        if (a == null && b == null) {
+    static boolean equivalent(LocalAssignment first, LocalAssignment second) {
+        if (first == null && second == null) {
             return true;
         }
-        if (a != null && b != null) {
-            if (a.get_topology_id().equals(b.get_topology_id())) {
-                Set<ExecutorInfo> aexec = new HashSet<>(a.get_executors());
-                Set<ExecutorInfo> bexec = new HashSet<>(b.get_executors());
+        if (first != null && second != null) {
+            if (first.get_topology_id().equals(second.get_topology_id())) {
+                Set<ExecutorInfo> aexec = new HashSet<>(first.get_executors());
+                Set<ExecutorInfo> bexec = new HashSet<>(second.get_executors());
                 if (aexec.equals(bexec)) {
-                    boolean aHasResources = a.is_set_resources();
-                    boolean bHasResources = b.is_set_resources();
-                    if (!aHasResources && !bHasResources) {
+                    boolean firstHasResources = first.is_set_resources();
+                    boolean secondHasResources = second.is_set_resources();
+                    if (!firstHasResources && !secondHasResources) {
                         return true;
                     }
-                    if (aHasResources && bHasResources) {
-                        if (a.get_resources().equals(b.get_resources())) {
-                            return true;
-                        }
+                    if (firstHasResources && secondHasResources) {
+                        WorkerResources firstResources = first.get_resources();
+                        WorkerResources secondResources = second.get_resources();
+                        return customWorkerResourcesEquality(firstResources, secondResources);
                     }
                 }
             }
@@ -248,9 +311,13 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
      * @return the next state
      * @throws IOException on any error
      */
-    private static DynamicState prepareForNewAssignmentNoWorkersRunning(DynamicState dynamicState, StaticState staticState) throws IOException {
+    private static DynamicState prepareForNewAssignmentNoWorkersRunning(DynamicState dynamicState,
+            StaticState staticState) throws IOException {
         assert (dynamicState.container == null);
+        assert dynamicState.currentAssignment == null;
 
+        //We're either going to empty, or starting fresh blob download. Either way, the changing blob notifications are outdated.
+        dynamicState = drainAllChangingBlobs(dynamicState);
         if (dynamicState.newAssignment == null) {
             return dynamicState.withState(MachineState.EMPTY);
         }
@@ -268,11 +335,11 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
         Boolean isDead = dynamicState.container.areAllProcessesDead();
         if (!isDead) {
             if (reason == KillReason.ASSIGNMENT_CHANGED || reason == KillReason.BLOB_CHANGED) {
-                staticState.iSupervisor.killedWorker(staticState.port);
+                staticState.supervisor.killedWorker(staticState.port);
             }
             dynamicState.container.kill();
         }
-        numWorkersKilledFor.get(reason).mark();
+        staticState.slotMetrics.numWorkersKilledFor.get(reason).mark();
 
         DynamicState next;
         switch (reason) {
@@ -282,7 +349,6 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
                     pendingDownload = staticState.localizer.requestDownloadTopologyBlobs(
                             dynamicState.newAssignment, staticState.port, staticState.changingCallback);
                 }
-                dynamicState = drainAllChangingBlobs(dynamicState);
                 next = dynamicState.withState(MachineState.KILL)
                         .withPendingLocalization(dynamicState.newAssignment, pendingDownload);
                 break;
@@ -336,10 +402,14 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
 
     /**
      * Drop all of the changingBlobs and pendingChangingBlobs.
+     * 
+     * <p>PRECONDITION: container is null
+     *
      * @param dynamicState current state.
      * @return the next state.
      */
     private static DynamicState drainAllChangingBlobs(DynamicState dynamicState) {
+        assert dynamicState.container == null;
         if (!dynamicState.changingBlobs.isEmpty()) {
             for (BlobChanging rc : dynamicState.changingBlobs) {
                 rc.latch.countDown();
@@ -358,8 +428,9 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
      * Informs the async localizer for all of blobs that the worker acknowledged the change of blobs.
      * Worker has stop as of now.
      *
-     * PRECONDITION: container is null
+     * <p>PRECONDITION: container is null
      * PRECONDITION: changingBlobs should only be for the given assignment.
+     *
      * @param dynamicState the current state
      * @return the futures for the current assignment.
      */
@@ -422,6 +493,7 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
         assert (dynamicState.pendingLocalization != null);
         assert (dynamicState.pendingDownload != null);
         assert (dynamicState.container == null);
+        assert dynamicState.currentAssignment == null;
 
         //Ignore changes to scheduling while downloading the topology blobs
         // We don't support canceling the download through the future yet,
@@ -436,18 +508,19 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
                 dynamicState = informChangedBlobs(dynamicState, dynamicState.pendingLocalization);
             }
 
-            // Wait until time out
-            dynamicState.pendingDownload.get(1000, TimeUnit.MILLISECONDS);
-            //Downloading of all blobs finished. This is the precondition for all codes below.
             if (!equivalent(dynamicState.newAssignment, dynamicState.pendingLocalization)) {
                 //Scheduling changed
                 staticState.localizer.releaseSlotFor(dynamicState.pendingLocalization, staticState.port);
                 // Switch to the new assignment even if localization hasn't completed, or go to empty state
                 // if no new assignment.
-                return prepareForNewAssignmentNoWorkersRunning(dynamicState.withPendingChangingBlobs(Collections.emptySet(), null),
-                                                               staticState);
+                return prepareForNewAssignmentNoWorkersRunning(dynamicState
+                    .withPendingLocalization(null, null),
+                    staticState);
             }
 
+            // Wait until time out
+            dynamicState.pendingDownload.get(1000, TimeUnit.MILLISECONDS);
+            //Downloading of all blobs finished. This is the precondition for all codes below.
             if (!dynamicState.pendingChangingBlobs.isEmpty()) {
                 LOG.info("There are pending changes, waiting for them to finish before launching container...");
                 //We cannot launch the container yet the resources may still be updating
@@ -455,8 +528,7 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
                                    .withPendingLocalization(null, null);
             }
 
-            dynamicState = updateAssignmentIfNeeded(dynamicState);
-            numWorkersLaunched.mark();
+            staticState.slotMetrics.numWorkersLaunched.mark();
             Container c =
                 staticState.containerLauncher.launchContainer(staticState.port, dynamicState.pendingLocalization, staticState.localState);
             return dynamicState
@@ -477,14 +549,17 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
             staticState.localizer.releaseSlotFor(dynamicState.pendingLocalization, staticState.port);
             // we wait for 3 seconds
             Time.sleepSecs(3);
-            return dynamicState.withState(MachineState.EMPTY);
+            //Try again, or go to empty if assignment has been nulled
+            return prepareForNewAssignmentNoWorkersRunning(dynamicState
+                .withPendingLocalization(null, null),
+                staticState);
         }
     }
 
     /**
      * State Transitions for WAITING_FOR_BLOB_UPDATE state.
      *
-     * PRECONDITION: container is null
+     * <p>PRECONDITION: container is null
      * PRECONDITION: pendingChangingBlobs is not empty (otherwise why did we go to this state)
      * PRECONDITION: pendingChangingBlobsAssignment is not null.
      *
@@ -498,6 +573,8 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
         assert dynamicState.container == null;
         assert dynamicState.pendingChangingBlobsAssignment != null;
         assert !dynamicState.pendingChangingBlobs.isEmpty();
+        assert dynamicState.pendingDownload == null;
+        assert dynamicState.pendingLocalization == null;
 
         if (!equivalent(dynamicState.newAssignment, dynamicState.currentAssignment)) {
             //We were rescheduled while waiting for the resources to be updated,
@@ -508,8 +585,7 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
                 staticState.localizer.releaseSlotFor(dynamicState.currentAssignment, staticState.port);
             }
             staticState.localizer.releaseSlotFor(dynamicState.pendingChangingBlobsAssignment, staticState.port);
-            return prepareForNewAssignmentNoWorkersRunning(dynamicState.withCurrentAssignment(null, null)
-                                                                       .withPendingChangingBlobs(Collections.emptySet(), null),
+            return prepareForNewAssignmentNoWorkersRunning(dynamicState.withCurrentAssignment(null, null),
                                                            staticState);
         }
 
@@ -552,12 +628,16 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
     private static DynamicState handleKill(DynamicState dynamicState, StaticState staticState) throws Exception {
         assert (dynamicState.container != null);
         assert (dynamicState.currentAssignment != null);
+        assert dynamicState.pendingChangingBlobs.isEmpty();
+        assert dynamicState.pendingChangingBlobsAssignment == null;
 
         if (dynamicState.container.areAllProcessesDead()) {
             LOG.info("SLOT {} all processes are dead...", staticState.port);
-            return cleanupCurrentContainer(dynamicState, staticState,
-                                           dynamicState.pendingLocalization ==
-                                           null ? MachineState.EMPTY : MachineState.WAITING_FOR_BLOB_LOCALIZATION);
+            return cleanupCurrentContainer(dynamicState,
+                    staticState,
+                    dynamicState.pendingLocalization == null
+                            ? MachineState.EMPTY
+                            : MachineState.WAITING_FOR_BLOB_LOCALIZATION);
         }
 
         LOG.warn("SLOT {} force kill and wait...", staticState.port);
@@ -578,6 +658,10 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
     private static DynamicState handleKillAndRelaunch(DynamicState dynamicState, StaticState staticState) throws Exception {
         assert (dynamicState.container != null);
         assert (dynamicState.currentAssignment != null);
+        assert dynamicState.pendingChangingBlobs.isEmpty();
+        assert dynamicState.pendingChangingBlobsAssignment == null;
+        assert dynamicState.pendingLocalization == null;
+        assert dynamicState.pendingDownload == null;
 
         if (dynamicState.container.areAllProcessesDead()) {
             if (equivalent(dynamicState.newAssignment, dynamicState.currentAssignment)) {
@@ -610,6 +694,10 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
     private static DynamicState handleKillBlobUpdate(DynamicState dynamicState, StaticState staticState) throws Exception {
         assert (dynamicState.container != null);
         assert (dynamicState.currentAssignment != null);
+        assert dynamicState.pendingChangingBlobs.isEmpty();
+        assert dynamicState.pendingChangingBlobsAssignment == null;
+        assert dynamicState.pendingDownload == null;
+        assert dynamicState.pendingLocalization == null;
 
         //Release things that don't need to wait for us
         dynamicState = filterChangingBlobsFor(dynamicState, dynamicState.currentAssignment);
@@ -644,11 +732,16 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
     private static DynamicState handleWaitingForWorkerStart(DynamicState dynamicState, StaticState staticState) throws Exception {
         assert (dynamicState.container != null);
         assert (dynamicState.currentAssignment != null);
+        assert dynamicState.pendingChangingBlobs.isEmpty();
+        assert dynamicState.pendingChangingBlobsAssignment == null;
+        assert dynamicState.pendingDownload == null;
+        assert dynamicState.pendingLocalization == null;
 
         LSWorkerHeartbeat hb = dynamicState.container.readHeartbeat();
         if (hb != null) {
             long hbAgeMs = (Time.currentTimeSecs() - hb.get_time_secs()) * 1000;
-            if (hbAgeMs <= staticState.hbTimeoutMs) {
+            long hbTimeoutMs = getHbTimeoutMs(staticState, dynamicState);
+            if (hbAgeMs <= hbTimeoutMs) {
                 return dynamicState.withState(MachineState.RUNNING);
             }
         }
@@ -662,9 +755,11 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
         dynamicState = updateAssignmentIfNeeded(dynamicState);
 
         long timeDiffms = (Time.currentTimeMillis() - dynamicState.startTime);
-        if (timeDiffms > staticState.firstHbTimeoutMs) {
+        long hbFirstTimeoutMs = getFirstHbTimeoutMs(staticState, dynamicState);
+        if (timeDiffms > hbFirstTimeoutMs) {
+            staticState.slotMetrics.numWorkerStartTimedOut.mark();
             LOG.warn("SLOT {}: Container {} failed to launch in {} ms.", staticState.port, dynamicState.container,
-                     staticState.firstHbTimeoutMs);
+                    hbFirstTimeoutMs);
             return killContainerFor(KillReason.HB_TIMEOUT, dynamicState, staticState);
         }
 
@@ -688,6 +783,10 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
     private static DynamicState handleRunning(DynamicState dynamicState, StaticState staticState) throws Exception {
         assert (dynamicState.container != null);
         assert (dynamicState.currentAssignment != null);
+        assert dynamicState.pendingChangingBlobs.isEmpty();
+        assert dynamicState.pendingChangingBlobsAssignment == null;
+        assert dynamicState.pendingDownload == null;
+        assert dynamicState.pendingLocalization == null;
 
         if (!equivalent(dynamicState.newAssignment, dynamicState.currentAssignment)) {
             LOG.info("SLOT {}: Assignment Changed from {} to {}", staticState.port, dynamicState.currentAssignment,
@@ -704,26 +803,31 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
         }
 
         if (dynamicState.container.didMainProcessExit()) {
-            LOG.warn("SLOT {}: main process has exited", staticState.port);
+            LOG.warn("SLOT {}: main process has exited for topology: {}",
+                    staticState.port, dynamicState.currentAssignment.get_topology_id());
             return killContainerFor(KillReason.PROCESS_EXIT, dynamicState, staticState);
         }
 
         if (dynamicState.container.isMemoryLimitViolated(dynamicState.currentAssignment)) {
-            LOG.warn("SLOT {}: violated memory limits", staticState.port);
+            LOG.warn("SLOT {}: violated memory limits for topology: {}",
+                    staticState.port, dynamicState.currentAssignment.get_topology_id());
             return killContainerFor(KillReason.MEMORY_VIOLATION, dynamicState, staticState);
         }
 
         LSWorkerHeartbeat hb = dynamicState.container.readHeartbeat();
         if (hb == null) {
-            LOG.warn("SLOT {}: HB returned as null", staticState.port);
+            LOG.warn("SLOT {}: HB returned as null for topology: {}",
+                    staticState.port, dynamicState.currentAssignment.get_topology_id());
             //This can happen if the supervisor crashed after launching a
             // worker that never came up.
             return killContainerFor(KillReason.HB_NULL, dynamicState, staticState);
         }
 
         long timeDiffMs = (Time.currentTimeSecs() - hb.get_time_secs()) * 1000;
-        if (timeDiffMs > staticState.hbTimeoutMs) {
-            LOG.warn("SLOT {}: HB is too old {} > {}", staticState.port, timeDiffMs, staticState.hbTimeoutMs);
+        long hbTimeoutMs = getHbTimeoutMs(staticState, dynamicState);
+        if (timeDiffMs > hbTimeoutMs) {
+            LOG.warn("SLOT {}: HB is too old {} > {} for topology: {}",
+                    staticState.port, timeDiffMs, hbTimeoutMs, dynamicState.currentAssignment.get_topology_id());
             return killContainerFor(KillReason.HB_TIMEOUT, dynamicState, staticState);
         }
 
@@ -783,8 +887,12 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
     }
 
     static DynamicState handleEmpty(DynamicState dynamicState, StaticState staticState) throws InterruptedException, IOException {
-        assert dynamicState.changingBlobs.isEmpty();
+        assert dynamicState.currentAssignment == null;
+        assert dynamicState.container == null;
+        assert dynamicState.pendingChangingBlobs.isEmpty();
         assert dynamicState.pendingChangingBlobsAssignment == null;
+        assert dynamicState.pendingDownload == null;
+        assert dynamicState.pendingLocalization == null;
         if (!equivalent(dynamicState.newAssignment, dynamicState.currentAssignment)) {
             return prepareForNewAssignmentNoWorkersRunning(dynamicState, staticState);
         }
@@ -802,26 +910,52 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
         return dynamicState;
     }
 
-    public MachineState getMachineState() {
+    MachineState getMachineState() {
         return dynamicState.state;
+    }
+
+    /*
+     * Get worker heartbeat timeout time in ms. Use topology specified timeout if provided.
+     */
+    private static long getHbTimeoutMs(StaticState staticState, DynamicState dynamicState) {
+        long hbTimeoutMs = staticState.hbTimeoutMs;
+        Map<String, Object> topoConf = dynamicState.container.topoConf;
+
+        if (topoConf != null && topoConf.containsKey(Config.TOPOLOGY_WORKER_TIMEOUT_SECS)) {
+            long topoHbTimeoutMs = ObjectReader.getInt(topoConf.get(Config.TOPOLOGY_WORKER_TIMEOUT_SECS)) * 1000;
+            topoHbTimeoutMs = Math.max(topoHbTimeoutMs, hbTimeoutMs);
+            hbTimeoutMs = topoHbTimeoutMs;
+        }
+
+        return hbTimeoutMs;
+    }
+
+    /*
+     * Get worker heartbeat timeout when waiting for worker to start.
+     * If topology specific timeout if set, ensure first heartbeat timeout >= topology specific timeout.
+     */
+    private static long getFirstHbTimeoutMs(StaticState staticState, DynamicState dynamicState) {
+        return Math.max(getHbTimeoutMs(staticState, dynamicState), staticState.firstHbTimeoutMs);
     }
 
     /**
      * Set a new assignment asynchronously.
      * @param newAssignment the new assignment for this slot to run, null to run nothing
      */
-    public void setNewAssignment(LocalAssignment newAssignment) {
-        this.newAssignment.set(newAssignment == null ? null : new TimerDecoratedAssignment(newAssignment, workerLaunchDuration));
+    public final void setNewAssignment(LocalAssignment newAssignment) {
+        this.newAssignment.set(newAssignment == null
+                ? null
+                : new TimerDecoratedAssignment(newAssignment, staticState.slotMetrics.workerLaunchDuration));
     }
 
     @Override
     public void blobChanging(LocalAssignment assignment, int port, LocallyCachedBlob blob, GoodToGo go) {
-        assert port == staticState.port : "got a callaback that is not for us " + port + " != " + staticState.port;
+        assert port == staticState.port : "got a callback that is not for us " + port + " != " + staticState.port;
         //This is called async so lets assume that it is something we care about
         try {
             changingBlobs.put(new BlobChanging(assignment, blob, go.getLatch()));
         } catch (InterruptedException e) {
-            throw new RuntimeException("This should not have happend, but it did (the queue is unbounded)", e);
+            throw new RuntimeException("This should not have happened, but it did (the queue is unbounded)", e);
         }
     }
 
@@ -878,11 +1012,11 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
         } while (!cachedCurrentAssignments.compareAndSet(orig, update));
     }
 
+    @Override
     public void run() {
         try {
             while (!done) {
                 Set<TopoProfileAction> origProfileActions = new HashSet<>(profiling.get());
-                Set<TopoProfileAction> removed = new HashSet<>(origProfileActions);
 
                 Set<BlobChanging> changingResourcesToHandle = dynamicState.changingBlobs;
                 if (!changingBlobs.isEmpty()) {
@@ -893,8 +1027,8 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
                     //Remove/Clean up changed requests that are not for us
                     while (it.hasNext()) {
                         BlobChanging rc = it.next();
-                        if (!forSameTopology(rc.assignment, dynamicState.currentAssignment) &&
-                            !forSameTopology(rc.assignment, dynamicState.newAssignment)) {
+                        if (!forSameTopology(rc.assignment, dynamicState.currentAssignment)
+                                && !forSameTopology(rc.assignment, dynamicState.newAssignment)) {
                             rc.latch.countDown(); //Ignore the future
                             it.remove();
                         }
@@ -910,16 +1044,20 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
                     LOG.info("STATE {} -> {}", dynamicState, nextState);
                 }
                 //Save the current state for recovery
-                if ((nextState.currentAssignment != null && !nextState.currentAssignment.equals(dynamicState.currentAssignment)) ||
-                    (dynamicState.currentAssignment != null && !dynamicState.currentAssignment.equals(nextState.currentAssignment))) {
+                if ((nextState.currentAssignment != null
+                                && !nextState.currentAssignment.equals(dynamicState.currentAssignment))
+                        || (dynamicState.currentAssignment != null
+                                && !dynamicState.currentAssignment.equals(nextState.currentAssignment))) {
                     LOG.info("SLOT {}: Changing current assignment from {} to {}", staticState.port, dynamicState.currentAssignment,
                              nextState.currentAssignment);
                     saveNewAssignment(nextState.currentAssignment);
                 }
 
                 if (equivalent(nextState.newAssignment, nextState.currentAssignment)
-                    && nextState.currentAssignment != null && nextState.currentAssignment.get_owner() == null
-                    && nextState.newAssignment != null && nextState.newAssignment.get_owner() != null) {
+                        && nextState.currentAssignment != null
+                        && nextState.currentAssignment.get_owner() == null
+                        && nextState.newAssignment != null
+                        && nextState.newAssignment.get_owner() != null) {
                     //This is an odd case for a rolling upgrade where the user on the old assignment may be null,
                     // but not on the new one.  Although in all other ways they are the same.
                     // If this happens we want to use the assignment with the owner.
@@ -929,6 +1067,7 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
                 }
 
                 // clean up the profiler actions that are not being processed
+                Set<TopoProfileAction> removed = new HashSet<>(origProfileActions);
                 removed.removeAll(dynamicState.profileActions);
                 removed.removeAll(dynamicState.pendingStopProfileActions);
                 for (TopoProfileAction action : removed) {
@@ -938,7 +1077,8 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
                         LOG.error("Error trying to remove profiling request, it will be retried", e);
                     }
                 }
-                Set<TopoProfileAction> orig, copy;
+                Set<TopoProfileAction> orig;
+                Set<TopoProfileAction> copy;
                 do {
                     orig = profiling.get();
                     copy = new HashSet<>(orig);
@@ -962,13 +1102,37 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
     }
 
     enum MachineState {
+        /**
+         * Slot is empty, and no worker is running.
+         */
         EMPTY,
+        /**
+         * Slot is running a worker.
+         */
         RUNNING,
+        /**
+         * Slot has launched a worker, and is waiting for it to heartbeat.
+         */
         WAITING_FOR_WORKER_START,
+        /**
+         * Slot has just killed its worker, and is now waiting for it to die so it can be relaunched in the same container.
+         */
         KILL_AND_RELAUNCH,
+        /**
+         * Slot has just killed its worker, and is now waiting for it to die so the container can be deleted. 
+         */
         KILL,
+        /**
+         * Slot has just killed its worker, and is now waiting for it to die so the localizer can update a blob.
+         */
         KILL_BLOB_UPDATE,
+        /**
+         * The slot is empty, and is waiting for blobs to download before the worker can be launched.
+         */
         WAITING_FOR_BLOB_LOCALIZATION,
+        /**
+         * The slot is empty, and is waiting for blobs to be updated before the worker can be (re)launched.
+         */
         WAITING_FOR_BLOB_UPDATE;
 
         @Override
@@ -986,19 +1150,21 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
         public final ContainerLauncher containerLauncher;
         public final int port;
         public final String host;
-        public final ISupervisor iSupervisor;
+        public final ISupervisor supervisor;
         public final LocalState localState;
         public final BlobChangingCallback changingCallback;
         public final OnlyLatestExecutor<Integer> metricsExec;
         public final WorkerMetricsProcessor metricsProcessor;
+        public final SlotMetrics slotMetrics;
 
         StaticState(AsyncLocalizer localizer, long hbTimeoutMs, long firstHbTimeoutMs,
                     long killSleepMs, long monitorFreqMs,
                     ContainerLauncher containerLauncher, String host, int port,
-                    ISupervisor iSupervisor, LocalState localState,
+                    ISupervisor supervisor, LocalState localState,
                     BlobChangingCallback changingCallback,
                     OnlyLatestExecutor<Integer> metricsExec,
-                    WorkerMetricsProcessor metricsProcessor) {
+                    WorkerMetricsProcessor metricsProcessor,
+                    SlotMetrics slotMetrics) {
             this.localizer = localizer;
             this.hbTimeoutMs = hbTimeoutMs;
             this.firstHbTimeoutMs = firstHbTimeoutMs;
@@ -1007,22 +1173,16 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
             this.monitorFreqMs = monitorFreqMs;
             this.host = host;
             this.port = port;
-            this.iSupervisor = iSupervisor;
+            this.supervisor = supervisor;
             this.localState = localState;
             this.changingCallback = changingCallback;
             this.metricsExec = metricsExec;
             this.metricsProcessor = metricsProcessor;
+            this.slotMetrics = slotMetrics;
         }
     }
 
     static class DynamicState {
-        private static final Map<MachineState, Meter> transitionIntoState = EnumUtil.toEnumMap(MachineState.class,
-            machineState -> StormMetricsRegistry.registerMeter("supervisor:num-worker-transitions-into-" + machineState.toString()));
-        //This also tracks how many times worker transitioning out of a state
-        private static final Map<MachineState, Timer> timeSpentInState = EnumUtil.toEnumMap(MachineState.class,
-            machineState -> StormMetricsRegistry.registerTimer("supervisor:time-worker-spent-in-state-" + machineState.toString() + "-ms")
-        );
-
         public final MachineState state;
 
         /**
@@ -1052,22 +1212,27 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
         public final Set<TopoProfileAction> pendingStopProfileActions;
 
         /**
-         * Blobs that are changed and need to be synced.
+         * Blobs that are changed and need to be synced. The localizer notifies the Slot about changing blobs on every state step.
+         * Blob updates are blocked until the Slot unblocks them, at which point they go in {@link #pendingChangingBlobs}.
+         * Updates are blocked until the Slot worker is dead, since blobs may otherwise be actively used.
          */
         public final Set<BlobChanging> changingBlobs;
+        
+        /**
+         * The assignment {@link #pendingChangingBlobs} belongs to.
+         */
         public final LocalAssignment pendingChangingBlobsAssignment;
 
-        /**
-         * Signals that acknowledged changing blobs have been updated.
-         */
         public final Set<Future<Void>> pendingChangingBlobs;
 
         /**
          * The entering time when the machine transitions to current state.
          */
         public final long startTime;
+        private final SlotMetrics slotMetrics;
 
-        public DynamicState(final LocalAssignment currentAssignment, Container container, final LocalAssignment newAssignment) {
+        DynamicState(final LocalAssignment currentAssignment, Container container, final LocalAssignment newAssignment,
+            SlotMetrics slotMetrics) {
             this.currentAssignment = currentAssignment;
             this.container = container;
             if ((currentAssignment == null) ^ (container == null)) {
@@ -1079,7 +1244,7 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
             } else {
                 state = MachineState.RUNNING;
             }
-            transitionIntoState.get(state).mark();
+            slotMetrics.transitionIntoState.get(state).mark();
 
             this.startTime = Time.currentTimeMillis();
             this.newAssignment = newAssignment;
@@ -1090,15 +1255,17 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
             this.changingBlobs = Collections.emptySet();
             this.pendingChangingBlobsAssignment = null;
             this.pendingChangingBlobs = Collections.emptySet();
+            this.slotMetrics = slotMetrics;
         }
 
-        public DynamicState(final MachineState state, final LocalAssignment newAssignment,
+        DynamicState(final MachineState state, final LocalAssignment newAssignment,
                             final Container container, final LocalAssignment currentAssignment,
                             final LocalAssignment pendingLocalization, final long startTime,
                             final Future<Void> pendingDownload, final Set<TopoProfileAction> profileActions,
                             final Set<TopoProfileAction> pendingStopProfileActions,
                             final Set<BlobChanging> changingBlobs,
-                            final Set<Future<Void>> pendingChangingBlobs, final LocalAssignment pendingChaningBlobsAssignment) {
+                            final Set<Future<Void>> pendingChangingBlobs, final LocalAssignment pendingChaningBlobsAssignment,
+                            final SlotMetrics slotMetrics) {
             assert pendingChangingBlobs != null;
             assert pendingChangingBlobs.isEmpty() == (pendingChaningBlobsAssignment == null);
             this.state = state;
@@ -1113,6 +1280,7 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
             this.changingBlobs = changingBlobs;
             this.pendingChangingBlobs = pendingChangingBlobs;
             this.pendingChangingBlobsAssignment = pendingChaningBlobsAssignment;
+            this.slotMetrics = slotMetrics;
         }
 
         public String toString() {
@@ -1139,7 +1307,7 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
                                     this.pendingLocalization, this.startTime,
                                     this.pendingDownload, this.profileActions,
                                     this.pendingStopProfileActions, this.changingBlobs,
-                                    this.pendingChangingBlobs, this.pendingChangingBlobsAssignment);
+                                    this.pendingChangingBlobs, this.pendingChangingBlobsAssignment, this.slotMetrics);
         }
 
         public DynamicState withPendingLocalization(LocalAssignment pendingLocalization, Future<Void> pendingDownload) {
@@ -1148,7 +1316,7 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
                                     pendingLocalization, this.startTime,
                                     pendingDownload, this.profileActions,
                                     this.pendingStopProfileActions, this.changingBlobs,
-                                    this.pendingChangingBlobs, this.pendingChangingBlobsAssignment);
+                                    this.pendingChangingBlobs, this.pendingChangingBlobsAssignment, this.slotMetrics);
         }
 
         public DynamicState withPendingLocalization(Future<Void> pendingDownload) {
@@ -1164,8 +1332,8 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
         public DynamicState withState(final MachineState state) {
             long newStartTime = Time.currentTimeMillis();
             //We may (though unlikely) lose metering here if state transition is too frequent (less than a millisecond)
-            timeSpentInState.get(this.state).update(newStartTime - startTime, TimeUnit.MILLISECONDS);
-            transitionIntoState.get(state).mark();
+            slotMetrics.timeSpentInState.get(this.state).update(newStartTime - startTime, TimeUnit.MILLISECONDS);
+            slotMetrics.transitionIntoState.get(state).mark();
 
             LocalAssignment assignment = this.currentAssignment;
             if (MachineState.RUNNING != this.state && MachineState.RUNNING == state
@@ -1180,7 +1348,7 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
                                     this.pendingLocalization, newStartTime,
                                     this.pendingDownload, this.profileActions,
                                     this.pendingStopProfileActions, this.changingBlobs,
-                                    this.pendingChangingBlobs, this.pendingChangingBlobsAssignment);
+                                    this.pendingChangingBlobs, this.pendingChangingBlobsAssignment, this.slotMetrics);
         }
 
         public DynamicState withCurrentAssignment(final Container container, final LocalAssignment currentAssignment) {
@@ -1189,7 +1357,7 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
                                     this.pendingLocalization, this.startTime,
                                     this.pendingDownload, this.profileActions,
                                     this.pendingStopProfileActions, this.changingBlobs,
-                                    this.pendingChangingBlobs, this.pendingChangingBlobsAssignment);
+                                    this.pendingChangingBlobs, this.pendingChangingBlobsAssignment, this.slotMetrics);
         }
 
         public DynamicState withProfileActions(Set<TopoProfileAction> profileActions, Set<TopoProfileAction> pendingStopProfileActions) {
@@ -1198,9 +1366,12 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
                                     this.pendingLocalization, this.startTime,
                                     this.pendingDownload, profileActions,
                                     pendingStopProfileActions, this.changingBlobs,
-                                    this.pendingChangingBlobs, this.pendingChangingBlobsAssignment);
+                                    this.pendingChangingBlobs, this.pendingChangingBlobsAssignment, this.slotMetrics);
         }
 
+        /**
+         * Set the blocked changing blobs. This is an input from the outside, and should never be called by the state machine steps.
+         */
         public DynamicState withChangingBlobs(Set<BlobChanging> changingBlobs) {
             if (changingBlobs == this.changingBlobs) {
                 return this;
@@ -1210,7 +1381,7 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
                                     this.pendingLocalization, this.startTime,
                                     this.pendingDownload, profileActions,
                                     this.pendingStopProfileActions, changingBlobs,
-                                    this.pendingChangingBlobs, this.pendingChangingBlobsAssignment);
+                                    this.pendingChangingBlobs, this.pendingChangingBlobsAssignment, this.slotMetrics);
         }
 
         public DynamicState withPendingChangingBlobs(Set<Future<Void>> pendingChangingBlobs,
@@ -1221,7 +1392,7 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
                                     this.pendingDownload, profileActions,
                                     this.pendingStopProfileActions, this.changingBlobs,
                                     pendingChangingBlobs,
-                                    pendingChangingBlobsAssignment);
+                                    pendingChangingBlobsAssignment, this.slotMetrics);
         }
     }
 
@@ -1229,7 +1400,7 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
         public final String topoId;
         public final ProfileRequest request;
 
-        public TopoProfileAction(String topoId, ProfileRequest request) {
+        TopoProfileAction(String topoId, ProfileRequest request) {
             this.topoId = topoId;
             this.request = request;
         }
@@ -1262,7 +1433,7 @@ public class Slot extends Thread implements AutoCloseable, BlobChangingCallback 
         private final LocallyCachedBlob blob;
         private final GoodToGo.GoodToGoLatch latch;
 
-        public BlobChanging(LocalAssignment assignment, LocallyCachedBlob blob, GoodToGo.GoodToGoLatch latch) {
+        BlobChanging(LocalAssignment assignment, LocallyCachedBlob blob, GoodToGo.GoodToGoLatch latch) {
             this.assignment = assignment;
             this.blob = blob;
             this.latch = latch;

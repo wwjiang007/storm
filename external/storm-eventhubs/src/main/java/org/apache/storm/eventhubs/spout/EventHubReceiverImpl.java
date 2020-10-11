@@ -23,6 +23,7 @@ import com.microsoft.azure.eventhubs.EventHubClient;
 import com.microsoft.azure.eventhubs.PartitionReceiver;
 import com.microsoft.azure.servicebus.ServiceBusException;
 import java.io.IOException;
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
@@ -39,6 +40,7 @@ public class EventHubReceiverImpl implements IEventHubReceiver {
     private final String entityName;
     private final String partitionId;
     private final String consumerGroupName;
+    private final int receiverTimeoutInMillis;
 
     private PartitionReceiver receiver;
     private EventHubClient ehClient;
@@ -51,6 +53,7 @@ public class EventHubReceiverImpl implements IEventHubReceiver {
         this.entityName = config.getEntityPath();
         this.partitionId = partitionId;
         this.consumerGroupName = config.getConsumerGroupName();
+        this.receiverTimeoutInMillis = config.getReceiverTimeoutInMillis();
         receiveApiLatencyMean = new ReducedMetric(new MeanReducer());
         receiveApiCallCount = new CountMetric();
         receiveMessageCount = new CountMetric();
@@ -58,9 +61,10 @@ public class EventHubReceiverImpl implements IEventHubReceiver {
 
     @Override
     public void open(IEventFilter filter) throws EventHubException {
-        logger.info("creating eventhub receiver: partitionId=" + partitionId +
-                    ", filter=" + filter.getOffset() != null ?
-                        filter.getOffset() : Long.toString(filter.getTime().toEpochMilli()));
+        logger.info("creating eventhub receiver: partitionId=" + partitionId
+                + ", filter=" + filter.getOffset() != null
+                ? filter.getOffset()
+                : Long.toString(filter.getTime().toEpochMilli()));
         long start = System.currentTimeMillis();
         try {
             ehClient = EventHubClient.createFromConnectionStringSync(connectionString);
@@ -79,8 +83,10 @@ public class EventHubReceiverImpl implements IEventHubReceiver {
                     filter.getTime(),
                     1);
             } else {
-                throw new RuntimeException("Eventhub receiver must have " +
-                                           "an offset or time to be created");
+                throw new RuntimeException("Eventhub receiver must have an offset or time to be created");
+            }
+            if (receiver != null) {
+                receiver.setReceiveTimeout(Duration.ofMillis(receiverTimeoutInMillis));
             }
         } catch (IOException e) {
             logger.error("Exception in creating ehclient" + e.toString());

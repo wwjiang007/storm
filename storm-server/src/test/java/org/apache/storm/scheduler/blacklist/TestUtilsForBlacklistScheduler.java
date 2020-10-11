@@ -83,6 +83,22 @@ public class TestUtilsForBlacklistScheduler {
         return retList;
     }
 
+    public static Map<String, SupervisorDetails> addPortToSupervisors(Map<String, SupervisorDetails> supervisorDetailsMap, String supervisor, int port) {
+        Map<String, SupervisorDetails> retList = new HashMap<String, SupervisorDetails>();
+        for (Map.Entry<String, SupervisorDetails> supervisorDetailsEntry : supervisorDetailsMap.entrySet()) {
+            String supervisorKey = supervisorDetailsEntry.getKey();
+            SupervisorDetails supervisorDetails = supervisorDetailsEntry.getValue();
+            Set<Integer> ports = new HashSet<>();
+            ports.addAll(supervisorDetails.getAllPorts());
+            if (supervisorKey.equals(supervisor)) {
+                ports.add(port);
+            }
+            SupervisorDetails sup = new SupervisorDetails(supervisorDetails.getId(), supervisorDetails.getHost(), null, (HashSet) ports, null);
+            retList.put(sup.getId(), sup);
+        }
+        return retList;
+    }
+
     public static Map<String, SupervisorDetails> genSupervisors(int numSup, int numPorts) {
         Map<String, SupervisorDetails> retList = new HashMap<>();
         for (int i = 0; i < numSup; i++) {
@@ -166,13 +182,16 @@ public class TestUtilsForBlacklistScheduler {
             _isDistributed = isDistributed;
         }
 
+        @Override
         public void open(Map<String, Object> conf, TopologyContext context, SpoutOutputCollector collector) {
             _collector = collector;
         }
 
+        @Override
         public void close() {
         }
 
+        @Override
         public void nextTuple() {
             Utils.sleep(100);
             final String[] words = new String[]{"nathan", "mike", "jackson", "golda", "bertels"};
@@ -181,12 +200,15 @@ public class TestUtilsForBlacklistScheduler {
             _collector.emit(new Values(word));
         }
 
+        @Override
         public void ack(Object msgId) {
         }
 
+        @Override
         public void fail(Object msgId) {
         }
 
+        @Override
         public void declareOutputFields(OutputFieldsDeclarer declarer) {
             declarer.declare(new Fields("word"));
         }

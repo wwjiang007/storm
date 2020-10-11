@@ -18,9 +18,11 @@
 
 package org.apache.storm.daemon.ui;
 
+import static org.apache.storm.utils.ConfigUtils.FILE_SEPARATOR;
+import static org.apache.storm.utils.ConfigUtils.STORM_HOME;
+
 import java.nio.file.Files;
 import java.nio.file.Paths;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.EnumSet;
 import java.util.List;
@@ -37,27 +39,25 @@ import org.apache.storm.daemon.ui.filters.HeaderResponseServletFilter;
 import org.apache.storm.metric.StormMetricsRegistry;
 import org.apache.storm.security.auth.IHttpCredentialsPlugin;
 import org.apache.storm.security.auth.ServerAuthUtils;
+import org.apache.storm.utils.ConfigUtils;
 import org.apache.storm.utils.ObjectReader;
 import org.apache.storm.utils.Utils;
 import org.eclipse.jetty.server.Server;
-import org.eclipse.jetty.server.ServerConnector;
 import org.eclipse.jetty.servlet.DefaultServlet;
 import org.eclipse.jetty.servlet.FilterHolder;
 import org.eclipse.jetty.servlet.ServletContextHandler;
 import org.eclipse.jetty.servlet.ServletHolder;
-
+import org.glassfish.hk2.utilities.binding.AbstractBinder;
 import org.glassfish.jersey.server.ResourceConfig;
 import org.glassfish.jersey.servlet.ServletContainer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import static org.apache.storm.utils.ConfigUtils.FILE_SEPARATOR;
-import static org.apache.storm.utils.ConfigUtils.STORM_HOME;
-
 /**
  * Main class.
  *
  */
+@SuppressWarnings("checkstyle:AbbreviationAsWordInName")
 public class UIServer {
 
     public static final Logger LOG = LoggerFactory.getLogger(UIServer.class);
@@ -83,7 +83,7 @@ public class UIServer {
      */
     public static void main(String[] args) {
 
-        Map<String, Object> conf = Utils.readStormConfig();
+        Map<String, Object> conf = ConfigUtils.readStormConfig();
         int headerBufferSize = (int) conf.get(DaemonConfig.UI_HEADER_BUFFER_BYTES);
         final Integer httpsPort = ObjectReader.getInt(conf.get(DaemonConfig.UI_HTTPS_PORT), 0);
         final String httpsKsPath = (String) (conf.get(DaemonConfig.UI_HTTPS_KEYSTORE_PATH));
@@ -95,15 +95,15 @@ public class UIServer {
         final String httpsTsType = (String) (conf.get(DaemonConfig.UI_HTTPS_TRUSTSTORE_TYPE));
         final Boolean httpsWantClientAuth = (Boolean) (conf.get(DaemonConfig.UI_HTTPS_WANT_CLIENT_AUTH));
         final Boolean httpsNeedClientAuth = (Boolean) (conf.get(DaemonConfig.UI_HTTPS_NEED_CLIENT_AUTH));
+        final Boolean disableHttpBinding = (Boolean) (conf.get(DaemonConfig.UI_DISABLE_HTTP_BINDING));
+        final boolean enableSslReload = ObjectReader.getBoolean(conf.get(DaemonConfig.UI_HTTPS_ENABLE_SSL_RELOAD), false);
 
         Server jettyServer =
                 UIHelpers.jettyCreateServer(
-                        (int) conf.get(DaemonConfig.UI_PORT), null, httpsPort, headerBufferSize
-                );
+                        (int) conf.get(DaemonConfig.UI_PORT), null, httpsPort, headerBufferSize, disableHttpBinding);
 
         UIHelpers.configSsl(jettyServer, httpsPort, httpsKsPath, httpsKsPassword, httpsKsType, httpsKeyPassword,
-                httpsTsPath, httpsTsPassword, httpsTsType, httpsNeedClientAuth, httpsWantClientAuth);
-
+                httpsTsPath, httpsTsPassword, httpsTsType, httpsNeedClientAuth, httpsWantClientAuth, enableSslReload);
 
         ServletContextHandler context = new ServletContextHandler(ServletContextHandler.SESSIONS);
         context.setContextPath("/");
@@ -118,14 +118,21 @@ public class UIServer {
 
         UIHelpers.configFilters(context, filterConfigurationList);
 
+        StormMetricsRegistry metricsRegistry = new StormMetricsRegistry();
         ResourceConfig resourceConfig =
-                new ResourceConfig()
-                        .packages("org.apache.storm.daemon.ui.resources")
-                        .register(AuthorizedUserFilter.class)
-                        .register(HeaderResponseFilter.class)
-                        .register(AuthorizationExceptionMapper.class)
-                        .register(NotAliveExceptionMapper.class)
-                        .register(DefaultExceptionMapper.class);
+            new ResourceConfig()
+                .packages("org.apache.storm.daemon.ui.resources")
+                .registerInstances(new AbstractBinder() {
+                    @Override
+                    protected void configure() {
+                        super.bind(metricsRegistry).to(StormMetricsRegistry.class);
+                    }
+                })
+                .register(AuthorizedUserFilter.class)
+                .register(HeaderResponseFilter.class)
+                .register(AuthorizationExceptionMapper.class)
+                .register(NotAliveExceptionMapper.class)
+                .register(DefaultExceptionMapper.class);
 
         ServletHolder jerseyServlet = new ServletHolder(new ServletContainer(resourceConfig));
         jerseyServlet.setInitOrder(0);
@@ -155,18 +162,19 @@ public class UIServer {
             }
         }
 
-        holderHome.setInitParameter("dirAllowed","true");
-        holderHome.setInitParameter("pathInfoOnly","true");
-        context.addFilter(new FilterHolder(new HeaderResponseServletFilter()), "/*", EnumSet.allOf(DispatcherType.class));
-        context.addServlet(holderHome,"/*");
+        holderHome.setInitParameter("dirAllowed", "true");
+        holderHome.setInitParameter("pathInfoOnly", "true");
+        context.addFilter(new FilterHolder(new HeaderResponseServletFilter(metricsRegistry)), "/*", EnumSet.allOf(DispatcherType.class));
+        context.addServlet(holderHome, "/*");
 
 
         // Lastly, the default servlet for root content (always needed, to satisfy servlet spec)
         ServletHolder holderPwd = new ServletHolder("default", DefaultServlet.class);
-        holderPwd.setInitParameter("dirAllowed","true");
-        context.addServlet(holderPwd,"/");
+        holderPwd.setInitParameter("dirAllowed", "true");
+        context.addServlet(holderPwd, "/");
 
-        StormMetricsRegistry.startMetricsReporters(conf);
+        metricsRegistry.startMetricsReporters(conf);
+        Utils.addShutdownHookWithForceKillIn1Sec(metricsRegistry::stopMetricsReporters);
         try {
             jettyServer.start();
             jettyServer.join();

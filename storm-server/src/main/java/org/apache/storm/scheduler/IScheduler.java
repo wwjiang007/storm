@@ -13,10 +13,11 @@
 package org.apache.storm.scheduler;
 
 import java.util.Map;
+import org.apache.storm.metric.StormMetricsRegistry;
 
-public interface IScheduler {
+public interface IScheduler extends INodeAssignmentSentCallBack {
 
-    void prepare(Map<String, Object> conf);
+    void prepare(Map<String, Object> conf, StormMetricsRegistry metricsRegistry);
 
     /**
      * Set assignments for the topologies which needs scheduling. The new assignments is available 
@@ -38,4 +39,10 @@ public interface IScheduler {
      * @return The scheduler's configuration.
      */
     Map config();
+
+    /**
+     * called once when the system is shutting down, should be idempotent.
+     */
+    default void cleanup() {
+    }
 }

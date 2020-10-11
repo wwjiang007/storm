@@ -34,6 +34,7 @@ import org.apache.storm.blobstore.ClientBlobStore;
 import org.apache.storm.daemon.supervisor.AdvancedFSOps;
 import org.apache.storm.generated.AuthorizationException;
 import org.apache.storm.generated.KeyNotFoundException;
+import org.apache.storm.metric.StormMetricsRegistry;
 import org.apache.storm.utils.ConfigUtils;
 import org.apache.storm.utils.ServerConfigUtils;
 import org.apache.storm.utils.ServerUtils;
@@ -53,21 +54,27 @@ public class LocallyCachedTopologyBlob extends LocallyCachedBlob {
     private final boolean isLocalMode;
     private final Path topologyBasicBlobsRootDir;
     private final AdvancedFSOps fsOps;
+    private final String owner;
     private volatile long version = NOT_DOWNLOADED_VERSION;
     private volatile long size = 0;
+    private final Map<String, Object> conf;
+
     /**
      * Create a new LocallyCachedBlob.
-     *
      * @param topologyId the ID of the topology.
      * @param type the type of the blob.
+     * @param owner the name of the user that owns this blob.
      */
     protected LocallyCachedTopologyBlob(final String topologyId, final boolean isLocalMode, final Map<String, Object> conf,
-                                        final AdvancedFSOps fsOps, final TopologyBlobType type) throws IOException {
-        super(topologyId + " " + type.getFileName(), type.getKey(topologyId));
+                                        final AdvancedFSOps fsOps, final TopologyBlobType type,
+                                        String owner, StormMetricsRegistry metricsRegistry) throws IOException {
+        super(topologyId + " " + type.getFileName(), type.getKey(topologyId), metricsRegistry);
         this.topologyId = topologyId;
         this.type = type;
         this.isLocalMode = isLocalMode;
         this.fsOps = fsOps;
+        this.owner = owner;
+        this.conf = conf;
         topologyBasicBlobsRootDir = Paths.get(ConfigUtils.supervisorStormDistRoot(conf, topologyId));
         readVersion();
         updateSizeOnDisk();
@@ -125,12 +132,17 @@ public class LocallyCachedTopologyBlob extends LocallyCachedBlob {
     @Override
     public long fetchUnzipToTemp(ClientBlobStore store)
         throws IOException, KeyNotFoundException, AuthorizationException {
+        synchronized (LocallyCachedTopologyBlob.class) {
+            if (!Files.exists(topologyBasicBlobsRootDir)) {
+                Files.createDirectories(topologyBasicBlobsRootDir);
+                fsOps.setupStormCodeDir(owner, topologyBasicBlobsRootDir.toFile());
+            }
+        }
         if (isLocalMode && type == TopologyBlobType.TOPO_JAR) {
             LOG.debug("DOWNLOADING LOCAL JAR to TEMP LOCATION... {}", topologyId);
             //This is a special case where the jar was not uploaded so we will not download it (it is already on the classpath)
-            ClassLoader classloader = Thread.currentThread().getContextClassLoader();
             String resourcesJar = resourcesJar();
-            URL url = classloader.getResource(ServerConfigUtils.RESOURCES_SUBDIR);
+            URL url = ServerUtils.getResourceFromClassloader(ServerConfigUtils.RESOURCES_SUBDIR);
             Path extractionDest = topologyBasicBlobsRootDir.resolve(type.getTempExtractionDir(LOCAL_MODE_JAR_VERSION));
             if (resourcesJar != null) {
                 LOG.info("Extracting resources from jar at {} to {}", resourcesJar, extractionDest);
@@ -143,6 +155,10 @@ public class LocallyCachedTopologyBlob extends LocallyCachedBlob {
                 } else {
                     fsOps.copyDirectory(new File(url.getFile()), extractionDest.toFile());
                 }
+            } else if (!fsOps.fileExists(extractionDest)) {
+                // if we can't find the resources directory in a resources jar or in the classpath just create an empty
+                // resources directory. This way we can check later that the topology jar was fully downloaded.
+                fsOps.forceMkdir(extractionDest);
             }
             return LOCAL_MODE_JAR_VERSION;
         }
@@ -172,22 +188,8 @@ public class LocallyCachedTopologyBlob extends LocallyCachedBlob {
             Files.createDirectories(dest);
         }
         try (JarFile jarFile = new JarFile(jarpath)) {
-            String toRemove = dir + '/';
-            Enumeration<JarEntry> jarEnums = jarFile.entries();
-            while (jarEnums.hasMoreElements()) {
-                JarEntry entry = jarEnums.nextElement();
-                String name = entry.getName();
-                if (!entry.isDirectory() && name.startsWith(toRemove)) {
-                    String shortenedName = name.replace(toRemove, "");
-                    Path targetFile = dest.resolve(shortenedName);
-                    LOG.debug("EXTRACTING {} SHORTENED to {} into {}", name, shortenedName, targetFile);
-                    fsOps.forceMkdir(targetFile.getParent());
-                    try (FileOutputStream out = new FileOutputStream(targetFile.toFile());
-                         InputStream in = jarFile.getInputStream(entry)) {
-                        IOUtils.copy(in, out);
-                    }
-                }
-            }
+            String prefix = dir + '/';
+            ServerUtils.extractZipFile(jarFile, dest.toFile(), prefix);
         }
     }
 
@@ -207,7 +209,7 @@ public class LocallyCachedTopologyBlob extends LocallyCachedBlob {
     }
 
     @Override
-    public void commitNewVersion(long newVersion) throws IOException {
+    protected void commitNewVersion(long newVersion) throws IOException {
         //This is not atomic (so if something bad happens in the middle we need to be able to recover
         Path tempLoc = topologyBasicBlobsRootDir.resolve(type.getTempFileName(newVersion));
         Path dest = topologyBasicBlobsRootDir.resolve(type.getFileName());
@@ -228,7 +230,20 @@ public class LocallyCachedTopologyBlob extends LocallyCachedBlob {
         }
         if (!(isLocalMode && type == TopologyBlobType.TOPO_JAR)) {
             //Don't try to move the JAR file in local mode, it does not exist because it was not uploaded
-            Files.move(tempLoc, dest);
+            fsOps.moveFile(tempLoc.toFile(), dest.toFile());
+        }
+        synchronized (LocallyCachedTopologyBlob.class) {
+            //This is a bit ugly, but it works.  In order to maintain the same directory structure that existed before
+            // we need to have storm conf, storm jar, and storm code in a shared directory, and we need to set the
+            // permissions for that entire directory, but the tracking is on a per item basis, so we are going to end
+            // up running the permission modification code once for each blob that is downloaded (3 times in this case).
+            // Because the permission modification code runs in a separate process we are doing a global lock to avoid
+            // any races between multiple versions running at the same time.  Ideally this would be on a per topology
+            // basis, but that is a lot harder and the changes run fairly quickly so it should not be a big deal.
+            fsOps.setupStormCodeDir(owner, topologyBasicBlobsRootDir.toFile());
+            File sharedMemoryDirFinalLocation = new File(ConfigUtils.sharedByTopologyDir(conf, topologyId));
+            sharedMemoryDirFinalLocation.mkdirs();
+            fsOps.setupWorkerArtifactsDir(owner, sharedMemoryDirFinalLocation);
         }
         LOG.debug("Writing out version file {} with version {}", versionFile, newVersion);
         FileUtils.write(versionFile.toFile(), Long.toString(newVersion), "UTF8");
@@ -248,11 +263,12 @@ public class LocallyCachedTopologyBlob extends LocallyCachedBlob {
     private void cleanUpTemp(String baseName) throws IOException {
         LOG.debug("Cleaning up temporary data in {}", topologyBasicBlobsRootDir);
         try (DirectoryStream<Path> children = fsOps.newDirectoryStream(topologyBasicBlobsRootDir,
-                                                                       (p) -> {
-                                                                           String fileName = p.getFileName().toString();
-                                                                           Matcher m = EXTRACT_BASE_NAME_AND_VERSION.matcher(fileName);
-                                                                           return m.matches() && baseName.equals(m.group(1));
-                                                                       })) {
+            (p) -> {
+                String fileName = p.getFileName().toString();
+                Matcher m = EXTRACT_BASE_NAME_AND_VERSION.matcher(fileName);
+                return m.matches() && baseName.equals(m.group(1));
+            })
+        ) {
             //children is only ever null if topologyBasicBlobsRootDir does not exist.  This happens during unit tests
             // And because a non-existant directory is by definition clean we are ignoring it.
             if (children != null) {

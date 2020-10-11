@@ -18,27 +18,31 @@
 package org.apache.storm.st.topology.window;
 
 import com.google.common.collect.Lists;
+
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+
 import org.apache.storm.generated.StormTopology;
 import org.apache.storm.st.topology.TestableTopology;
 import org.apache.storm.st.topology.window.data.TimeData;
 import org.apache.storm.st.utils.StringDecorator;
 import org.apache.storm.topology.TopologyBuilder;
 import org.apache.storm.topology.base.BaseWindowedBolt;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.List;
-import java.util.concurrent.TimeUnit;
-
 /**
- * Computes sliding window sum
+ * Computes sliding window sum.
  */
 public class SlidingTimeCorrectness implements TestableTopology {
     private static final Logger LOG = LoggerFactory.getLogger(SlidingTimeCorrectness.class);
     private final int windowSec;
     private final int slideSec;
     private final String spoutName;
+    private final int spoutExecutors = 2;
     private final String boltName;
+    private final int boltExecutors = 1;
 
     public SlidingTimeCorrectness(int windowSec, int slideSec) {
         this.windowSec = windowSec;
@@ -59,16 +63,26 @@ public class SlidingTimeCorrectness implements TestableTopology {
     }
 
     @Override
+    public int getBoltExecutors() {
+        return boltExecutors;
+    }
+
+    @Override
+    public int getSpoutExecutors() {
+        return spoutExecutors;
+    }
+
+    @Override
     public StormTopology newTopology() {
         TopologyBuilder builder = new TopologyBuilder();
-        builder.setSpout(getSpoutName(), new TimeDataIncrementingSpout(), 2);
+        builder.setSpout(getSpoutName(), new TimeDataIncrementingSpout(), spoutExecutors);
         builder.setBolt(getBoltName(),
                 new TimeDataVerificationBolt()
                         .withWindow(new BaseWindowedBolt.Duration(windowSec, TimeUnit.SECONDS),
                                 new BaseWindowedBolt.Duration(slideSec, TimeUnit.SECONDS))
                         .withTimestampField(TimeData.getTimestampFieldName())
                         .withLag(new BaseWindowedBolt.Duration(10, TimeUnit.SECONDS)),
-                1)
+                boltExecutors)
                 .globalGrouping(getSpoutName());
         return builder.createTopology();
     }

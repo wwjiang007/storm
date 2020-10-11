@@ -47,7 +47,7 @@ The easiest way to use Flux, is to add it as a Maven dependency in you project a
 If you would like to build Flux from source and run the unit/integration tests, you will need the following installed
 on your system:
 
-* Python 2.6.x or later
+* Python 2.7.x or later
 * Node.js 0.10.x or later
 
 #### Building with unit tests enabled:
@@ -479,7 +479,7 @@ well.
 ### Using Java `enum`s in Contructor Arguments, References, Properties and Configuration Methods
 You can easily use Java `enum` values as arguments in a Flux YAML file, simply by referencing the name of the `enum`.
 
-For example, [Storm's HDFS module]() includes the following `enum` definition (simplified for brevity):
+For example, [Storm's HDFS module](storm-hdfs.html) includes the following `enum` definition (simplified for brevity):
 
 ```java
 public static enum Units {

@@ -12,6 +12,7 @@
 
 package org.apache.storm.scheduler.blacklist.strategies;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -23,18 +24,20 @@ import org.apache.storm.scheduler.Cluster;
 import org.apache.storm.scheduler.SupervisorDetails;
 import org.apache.storm.scheduler.Topologies;
 import org.apache.storm.scheduler.TopologyDetails;
-import org.apache.storm.scheduler.WorkerSlot;
 import org.apache.storm.scheduler.blacklist.reporters.IReporter;
 import org.apache.storm.scheduler.blacklist.reporters.LogReporter;
 import org.apache.storm.utils.ObjectReader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+/**
+ * The default strategy used for blacklisting hosts.
+ */
 public class DefaultBlacklistStrategy implements IBlacklistStrategy {
 
     public static final int DEFAULT_BLACKLIST_SCHEDULER_RESUME_TIME = 1800;
     public static final int DEFAULT_BLACKLIST_SCHEDULER_TOLERANCE_COUNT = 3;
-    private static Logger LOG = LoggerFactory.getLogger(DefaultBlacklistStrategy.class);
+    private static final Logger LOG = LoggerFactory.getLogger(DefaultBlacklistStrategy.class);
     private IReporter reporter;
 
     private int toleranceCount;
@@ -58,8 +61,10 @@ public class DefaultBlacklistStrategy implements IBlacklistStrategy {
     }
 
     @Override
-    public Set<String> getBlacklist(List<Map<String, Set<Integer>>> supervisorsWithFailures, Cluster cluster, Topologies topologies) {
-        Map<String, Integer> countMap = new HashMap<String, Integer>();
+    public Set<String> getBlacklist(List<Map<String, Set<Integer>>> supervisorsWithFailures,
+                                    List<Map<String, Integer>> sendAssignmentFailureCount,
+                                    Cluster cluster, Topologies topologies) {
+        Map<String, Integer> countMap = new HashMap<>();
 
         for (Map<String, Set<Integer>> item : supervisorsWithFailures) {
             Set<String> supervisors = item.keySet();
@@ -68,32 +73,52 @@ public class DefaultBlacklistStrategy implements IBlacklistStrategy {
                 countMap.put(supervisor, supervisorCount + 1);
             }
         }
+
+        // update countMap failures for sendAssignments failing
+        for (Map<String, Integer> item : sendAssignmentFailureCount) {
+            for (Map.Entry<String, Integer> entry : item.entrySet()) {
+                String supervisorNode = entry.getKey();
+                int sendAssignmentFailures = entry.getValue() + countMap.getOrDefault(supervisorNode, 0);
+                countMap.put(supervisorNode, sendAssignmentFailures);
+            }
+        }
+
         for (Map.Entry<String, Integer> entry : countMap.entrySet()) {
             String supervisor = entry.getKey();
             int count = entry.getValue();
             if (count >= toleranceCount) {
                 if (!blacklist.containsKey(supervisor)) { // if not in blacklist then add it and set the resume time according to config
-                    LOG.debug("add supervisor {} to blacklist", supervisor);
+                    LOG.debug("Added supervisor {} to blacklist", supervisor);
                     LOG.debug("supervisorsWithFailures : {}", supervisorsWithFailures);
+                    LOG.debug("sendAssignmentFailureCount: {}", sendAssignmentFailureCount);
                     reporter.reportBlacklist(supervisor, supervisorsWithFailures);
                     blacklist.put(supervisor, resumeTime / nimbusMonitorFreqSecs);
                 }
             }
         }
-        releaseBlacklistWhenNeeded(cluster, topologies);
+        Set<String> toRelease = releaseBlacklistWhenNeeded(cluster, new ArrayList<>(blacklist.keySet()));
+        // After having computed the final blacklist,
+        // the nodes which are released due to resource shortage will be put to the "greylist".
+        if (toRelease != null) {
+            LOG.debug("Releasing {} nodes because of low resources", toRelease.size());
+            cluster.setGreyListedSupervisors(toRelease);
+            for (String key : toRelease) {
+                blacklist.remove(key);
+            }
+        }
         return blacklist.keySet();
     }
 
     @Override
     public void resumeFromBlacklist() {
-        Set<String> readyToRemove = new HashSet<String>();
+        Set<String> readyToRemove = new HashSet<>();
         for (Map.Entry<String, Integer> entry : blacklist.entrySet()) {
-            String key = entry.getKey();
-            int value = entry.getValue() - 1;
-            if (value == 0) {
-                readyToRemove.add(key);
+            String supervisor = entry.getKey();
+            int countUntilResume = entry.getValue() - 1;
+            if (countUntilResume == 0) {
+                readyToRemove.add(supervisor);
             } else {
-                blacklist.put(key, value);
+                blacklist.put(supervisor, countUntilResume);
             }
         }
         for (String key : readyToRemove) {
@@ -102,48 +127,56 @@ public class DefaultBlacklistStrategy implements IBlacklistStrategy {
         }
     }
 
-    private void releaseBlacklistWhenNeeded(Cluster cluster, Topologies topologies) {
-        if (blacklist.size() > 0) {
-            int totalNeedNumWorkers = 0;
-            List<TopologyDetails> needSchedulingTopologies = cluster.needsSchedulingTopologies();
-            for (TopologyDetails topologyDetails : needSchedulingTopologies) {
-                int numWorkers = topologyDetails.getNumWorkers();
-                int assignedNumWorkers = cluster.getAssignedNumWorkers(topologyDetails);
-                int unAssignedNumWorkers = numWorkers - assignedNumWorkers;
-                totalNeedNumWorkers += unAssignedNumWorkers;
+    /**
+     * Decide when/if to release blacklisted hosts.
+     * @param cluster the current state of the cluster.
+     * @param blacklistedNodeIds the current set of blacklisted node ids sorted by earliest
+     * @return the set of nodes to be released.
+     */
+    protected Set<String> releaseBlacklistWhenNeeded(Cluster cluster, final List<String> blacklistedNodeIds) {
+        Set<String> readyToRemove = new HashSet<>();
+        if (blacklistedNodeIds.size() > 0) {
+            int availableSlots = cluster.getNonBlacklistedAvailableSlots(blacklistedNodeIds).size();
+            int neededSlots = 0;
+
+            for (TopologyDetails td : cluster.needsSchedulingTopologies()) {
+                int slots = td.getNumWorkers();
+                int assignedSlots = cluster.getAssignedNumWorkers(td);
+                int tdSlotsNeeded = slots - assignedSlots;
+                neededSlots += tdSlotsNeeded;
             }
+
+            //Now we need to free up some resources...
             Map<String, SupervisorDetails> availableSupervisors = cluster.getSupervisors();
-            List<WorkerSlot> availableSlots = cluster.getAvailableSlots();
-            int availableSlotsNotInBlacklistCount = 0;
-            for (WorkerSlot slot : availableSlots) {
-                if (!blacklist.containsKey(slot.getNodeId())) {
-                    availableSlotsNotInBlacklistCount += 1;
-                }
-            }
-            int shortage = totalNeedNumWorkers - availableSlotsNotInBlacklistCount;
+            int shortageSlots = neededSlots - availableSlots;
+            LOG.debug("Need {} slots.", neededSlots);
+            LOG.debug("Available {} slots.", availableSlots);
+            LOG.debug("Shortage {} slots.", shortageSlots);
 
-            if (shortage > 0) {
-                LOG.info("total needed num of workers :{}, available num of slots not in blacklist :{}, num blacklist :{}, " +
-                         "will release some blacklist.", totalNeedNumWorkers, availableSlotsNotInBlacklistCount, blacklist.size());
+            if (shortageSlots > 0) {
+                LOG.info("Need {} slots more. Releasing some blacklisted nodes to cover it.", shortageSlots);
 
-                //release earliest blacklist
-                Set<String> readyToRemove = new HashSet<>();
-                for (String supervisor : blacklist.keySet()) { //blacklist is treeMap sorted by value, minimum value means earliest
-                    if (availableSupervisors.containsKey(supervisor)) {
-                        Set<Integer> ports = cluster.getAvailablePorts(availableSupervisors.get(supervisor));
-                        readyToRemove.add(supervisor);
-                        shortage -= ports.size();
-                        if (shortage <= 0) { //released enough supervisor
-                            break;
+                //release earliest blacklist - but release all supervisors on a given blacklisted host.
+                Map<String, Set<String>> hostToSupervisorIds = createHostToSupervisorMap(blacklistedNodeIds, cluster);
+                for (Set<String> supervisorIds : hostToSupervisorIds.values()) {
+                    for (String supervisorId : supervisorIds) {
+                        SupervisorDetails sd = availableSupervisors.get(supervisorId);
+                        if (sd != null) {
+                            int sdAvailableSlots = cluster.getAvailablePorts(sd).size();
+                            readyToRemove.add(supervisorId);
+                            shortageSlots -= sdAvailableSlots;
+                            LOG.debug("Releasing {} with {} slots leaving {} slots to go", supervisorId,
+                                    sdAvailableSlots, shortageSlots);
                         }
                     }
-                }
-                for (String key : readyToRemove) {
-                    blacklist.remove(key);
-                    LOG.info("release supervisor {} for shortage of worker slots.", key);
+                    if (shortageSlots <= 0) {
+                        // we have enough resources now...
+                        break;
+                    }
                 }
             }
         }
+        return readyToRemove;
     }
 
     private Object initializeInstance(String className, String representation) {
@@ -159,5 +192,21 @@ public class DefaultBlacklistStrategy implements IBlacklistStrategy {
             LOG.error("Throw IllegalAccessException {} for name {}", representation, className);
             throw new RuntimeException(e);
         }
+    }
+
+    protected Map<String, Set<String>> createHostToSupervisorMap(final List<String> blacklistedNodeIds, Cluster cluster) {
+        Map<String, Set<String>> hostToSupervisorMap = new TreeMap<>();
+        for (String supervisorId : blacklistedNodeIds) {
+            String hostname = cluster.getHost(supervisorId);
+            if (hostname != null) {
+                Set<String> supervisorIds = hostToSupervisorMap.get(hostname);
+                if (supervisorIds == null) {
+                    supervisorIds = new HashSet<>();
+                    hostToSupervisorMap.put(hostname, supervisorIds);
+                }
+                supervisorIds.add(supervisorId);
+            }
+        }
+        return hostToSupervisorMap;
     }
 }

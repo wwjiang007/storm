@@ -25,18 +25,18 @@ import org.apache.storm.task.TopologyContext;
 import org.apache.storm.trident.spout.IPartitionedTridentSpout;
 import org.apache.storm.tuple.Fields;
 
-public class KafkaTridentSpoutTransactional<K,V> implements IPartitionedTridentSpout<List<Map<String, Object>>,
+public class KafkaTridentSpoutTransactional<K, V> implements IPartitionedTridentSpout<List<Map<String, Object>>,
         KafkaTridentSpoutTopicPartition, Map<String, Object>>,
         Serializable {
     private static final long serialVersionUID = 1L;
     
-    private final KafkaSpoutConfig<K, V> kafkaSpoutConfig;
+    private final KafkaTridentSpoutConfig<K, V> kafkaSpoutConfig;
     private final OutputFieldsExtractor outputFieldsExtractor;
 
     /**
      * Creates a new non-opaque transactional Trident Kafka spout.
      */
-    public KafkaTridentSpoutTransactional(KafkaSpoutConfig<K, V> kafkaSpoutConfig) {
+    public KafkaTridentSpoutTransactional(KafkaTridentSpoutConfig<K, V> kafkaSpoutConfig) {
         this.kafkaSpoutConfig = kafkaSpoutConfig;
         this.outputFieldsExtractor = new OutputFieldsExtractor();
     }

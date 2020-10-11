@@ -12,6 +12,8 @@
 
 package org.apache.storm.nimbus;
 
+import com.codahale.metrics.Meter;
+
 import java.io.IOException;
 import java.util.HashSet;
 import java.util.List;
@@ -20,9 +22,9 @@ import java.util.Set;
 import java.util.TreeSet;
 import javax.security.auth.Subject;
 
-import com.codahale.metrics.Meter;
 import org.apache.commons.io.IOUtils;
 import org.apache.storm.Config;
+import org.apache.storm.DaemonConfig;
 import org.apache.storm.blobstore.BlobStore;
 import org.apache.storm.blobstore.InputStreamWithMeta;
 import org.apache.storm.cluster.ClusterUtils;
@@ -39,6 +41,7 @@ import org.apache.storm.shade.org.apache.curator.framework.CuratorFramework;
 import org.apache.storm.shade.org.apache.curator.framework.recipes.leader.LeaderLatch;
 import org.apache.storm.shade.org.apache.zookeeper.CreateMode;
 import org.apache.storm.shade.org.apache.zookeeper.data.ACL;
+import org.apache.storm.utils.ObjectReader;
 import org.apache.storm.utils.Utils;
 import org.apache.storm.zookeeper.ClientZookeeper;
 import org.slf4j.Logger;
@@ -48,39 +51,47 @@ import org.slf4j.LoggerFactory;
  * A callback function when nimbus gains leadership.
  */
 public class LeaderListenerCallback {
-    private static final Meter numGainedLeader = StormMetricsRegistry.registerMeter("nimbus:num-gained-leadership");
-    private static final Meter numLostLeader = StormMetricsRegistry.registerMeter("nimbus:num-lost-leadership");
     private static final Logger LOG = LoggerFactory.getLogger(LeaderListenerCallback.class);
     private static final String STORM_JAR_SUFFIX = "-stormjar.jar";
     private static final String STORM_CODE_SUFFIX = "-stormcode.ser";
     private static final String STORM_CONF_SUFFIX = "-stormconf.ser";
+    
+    private final Meter numGainedLeader;
+    private final Meter numLostLeader;
+    
     private final BlobStore blobStore;
     private final TopoCache tc;
     private final IStormClusterState clusterState;
     private final CuratorFramework zk;
-    private final LeaderLatch leaderLatch;
+    private final ILeaderElector leaderElector;
     private final Map conf;
     private final List<ACL> acls;
+    private final int requeueDelayMs;
 
     /**
      * Constructor for {@LeaderListenerCallback}.
      * @param conf config
      * @param zk zookeeper CuratorFramework client
-     * @param leaderLatch LeaderLatch
      * @param blobStore BlobStore
+     * @param leaderElector Leader elector
      * @param tc TopoCache
      * @param clusterState IStormClusterState
      * @param acls zookeeper acls
      */
-    public LeaderListenerCallback(Map conf, CuratorFramework zk, LeaderLatch leaderLatch, BlobStore blobStore,
-                                  TopoCache tc, IStormClusterState clusterState, List<ACL> acls) {
+    public LeaderListenerCallback(Map conf, CuratorFramework zk, BlobStore blobStore, ILeaderElector leaderElector,
+                                  TopoCache tc, IStormClusterState clusterState, List<ACL> acls, StormMetricsRegistry metricsRegistry) {
         this.blobStore = blobStore;
         this.tc = tc;
         this.clusterState = clusterState;
         this.zk = zk;
-        this.leaderLatch = leaderLatch;
+        this.leaderElector = leaderElector;
         this.conf = conf;
         this.acls = acls;
+        this.numGainedLeader = metricsRegistry.registerMeter("nimbus:num-gained-leadership");
+        this.numLostLeader = metricsRegistry.registerMeter("nimbus:num-lost-leadership");
+        //Since we only give up leadership if we're waiting for blobs to sync,
+        //it makes sense to wait a full sync cycle before trying for leadership again.
+        this.requeueDelayMs = ObjectReader.getInt(conf.get(DaemonConfig.NIMBUS_CODE_SYNC_FREQ_SECS)) * 1000;
     }
 
     /**
@@ -125,11 +136,11 @@ public class LeaderListenerCallback {
             } else {
                 LOG.info("Code for all active topologies is available locally, but some dependencies are not found locally, "
                          + "giving up leadership.");
-                closeLatch();
+                surrenderLeadership();
             }
         } else {
             LOG.info("code for all active topologies not available locally, giving up leadership.");
-            closeLatch();
+            surrenderLeadership();
         }
     }
 
@@ -192,8 +203,7 @@ public class LeaderListenerCallback {
         Subject subject = ReqContext.context().subject();
 
         for (String activeTopologyCodeKey : activeTopologyCodeKeys) {
-            try {
-                InputStreamWithMeta blob = blobStore.getBlob(activeTopologyCodeKey, subject);
+            try (InputStreamWithMeta blob = blobStore.getBlob(activeTopologyCodeKey, subject)) {
                 byte[] blobContent = IOUtils.readFully(blob, new Long(blob.getFileLength()).intValue());
                 StormTopology stormCode = Utils.deserialize(blobContent, StormTopology.class);
                 if (stormCode.is_set_dependency_jars()) {
@@ -215,11 +225,11 @@ public class LeaderListenerCallback {
         return activeTopologyDependencies;
     }
 
-    private void closeLatch() {
+    private void surrenderLeadership() {
         try {
-            leaderLatch.close();
-        } catch (IOException e) {
-            throw new RuntimeException(e);
+            leaderElector.quitElectionFor(requeueDelayMs);
+        } catch (Exception e) {
+            throw Utils.wrapInRuntime(e);
         }
     }
 

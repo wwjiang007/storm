@@ -12,10 +12,16 @@
 
 package org.apache.storm.daemon.supervisor;
 
+import static org.hamcrest.CoreMatchers.is;
+import static org.hamcrest.CoreMatchers.nullValue;
+
+import com.google.common.collect.Maps;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -52,6 +58,9 @@ import static org.junit.Assert.assertThat;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.Mockito.*;
 
+import java.util.concurrent.ExecutionException;
+import org.apache.storm.metric.StormMetricsRegistry;
+
 public class SlotTest {
     private static final Logger LOG = LoggerFactory.getLogger(SlotTest.class);
 
@@ -69,6 +78,14 @@ public class SlotTest {
             resources.set_mem_off_heap(mem_off_heap);
         }
         return resources;
+    }
+
+    static WorkerResources mkWorkerResources(Double cpu, Double mem_on_heap, Double mem_off_heap, Map<String, Double> resources) {
+        WorkerResources workerResources = mkWorkerResources(cpu, mem_on_heap, mem_off_heap);
+        if (resources != null) {
+            workerResources.set_resources(resources);
+        }
+        return workerResources;
     }
 
     static LSWorkerHeartbeat mkWorkerHB(String id, int port, List<ExecutorInfo> exec, Integer timeSecs) {
@@ -102,12 +119,64 @@ public class SlotTest {
     }
 
     @Test
-    public void testEquivilant() {
+    public void testWorkerResourceEquality() {
+        WorkerResources resourcesRNull = mkWorkerResources(100.0, 100.0, 100.0, null);
+        WorkerResources resourcesREmpty = mkWorkerResources(100.0, 100.0, 100.0, Maps.newHashMap());
+        assertTrue(Slot.customWorkerResourcesEquality(resourcesRNull,resourcesREmpty));
+
+        Map resources = new HashMap<String, Double>();
+        resources.put("network.resource.units", 0.0);
+        WorkerResources resourcesRNetwork = mkWorkerResources(100.0, 100.0, 100.0,resources);
+        assertTrue(Slot.customWorkerResourcesEquality(resourcesREmpty, resourcesRNetwork));
+
+
+        Map resourcesNetwork = new HashMap<String, Double>();
+        resourcesNetwork.put("network.resource.units", 50.0);
+        WorkerResources resourcesRNetworkNonZero = mkWorkerResources(100.0, 100.0, 100.0,resourcesNetwork);
+        assertFalse(Slot.customWorkerResourcesEquality(resourcesREmpty, resourcesRNetworkNonZero));
+
+        Map resourcesNetworkOne = new HashMap<String, Double>();
+        resourcesNetworkOne.put("network.resource.units", 50.0);
+        WorkerResources resourcesRNetworkOne = mkWorkerResources(100.0, 100.0, 100.0,resourcesNetworkOne);
+        assertTrue(Slot.customWorkerResourcesEquality(resourcesRNetworkOne, resourcesRNetworkNonZero));
+
+        Map resourcesNetworkTwo = new HashMap<String, Double>();
+        resourcesNetworkTwo.put("network.resource.units", 100.0);
+        WorkerResources resourcesRNetworkTwo = mkWorkerResources(100.0, 100.0, 100.0,resourcesNetworkTwo);
+        assertFalse(Slot.customWorkerResourcesEquality(resourcesRNetworkOne, resourcesRNetworkTwo));
+
+        WorkerResources resourcesCpuNull = mkWorkerResources(null, 100.0,100.0);
+        WorkerResources resourcesCPUZero = mkWorkerResources(0.0, 100.0,100.0);
+        assertTrue(Slot.customWorkerResourcesEquality(resourcesCpuNull, resourcesCPUZero));
+
+        WorkerResources resourcesOnHeapMemNull = mkWorkerResources(100.0, null,100.0);
+        WorkerResources resourcesOnHeapMemZero = mkWorkerResources(100.0, 0.0,100.0);
+        assertTrue(Slot.customWorkerResourcesEquality(resourcesOnHeapMemNull, resourcesOnHeapMemZero));
+
+        WorkerResources resourcesOffHeapMemNull = mkWorkerResources(100.0, 100.0,null);
+        WorkerResources resourcesOffHeapMemZero = mkWorkerResources(100.0, 100.0,0.0);
+        assertTrue(Slot.customWorkerResourcesEquality(resourcesOffHeapMemNull, resourcesOffHeapMemZero));
+
+    }
+
+    @Test
+    public void testEquivalent() {
         LocalAssignment a = mkLocalAssignment("A", mkExecutorInfoList(1, 2, 3, 4, 5), mkWorkerResources(100.0, 100.0, 100.0));
         LocalAssignment aResized = mkLocalAssignment("A", mkExecutorInfoList(1, 2, 3, 4, 5), mkWorkerResources(100.0, 200.0, 100.0));
         LocalAssignment b = mkLocalAssignment("B", mkExecutorInfoList(1, 2, 3, 4, 5, 6), mkWorkerResources(100.0, 100.0, 100.0));
         LocalAssignment bReordered = mkLocalAssignment("B", mkExecutorInfoList(6, 5, 4, 3, 2, 1), mkWorkerResources(100.0, 100.0, 100.0));
 
+        LocalAssignment c = mkLocalAssignment("C", mkExecutorInfoList(188, 261),mkWorkerResources(400.0,10000.0,0.0));
+
+        WorkerResources workerResources = mkWorkerResources(400.0, 10000.0, 0.0);
+        Map<String, Double> additionalResources = workerResources.get_resources();
+        if( additionalResources == null) additionalResources = new HashMap<>();
+        additionalResources.put("network.resource.units", 0.0);
+
+        workerResources.set_resources(additionalResources);
+        LocalAssignment cReordered = mkLocalAssignment("C", mkExecutorInfoList(188, 261), workerResources);
+
+        assertTrue(Slot.equivalent(c,cReordered));
         assertTrue(Slot.equivalent(null, null));
         assertTrue(Slot.equivalent(a, a));
         assertTrue(Slot.equivalent(b, bReordered));
@@ -147,9 +216,11 @@ public class SlotTest {
             BlobChangingCallback cb = mock(BlobChangingCallback.class);
             ContainerLauncher containerLauncher = mock(ContainerLauncher.class);
             ISupervisor iSuper = mock(ISupervisor.class);
+            SlotMetrics slotMetrics = new SlotMetrics(new StormMetricsRegistry());
             StaticState staticState = new StaticState(localizer, 1000, 1000, 1000, 1000,
-                                                      containerLauncher, "localhost", 8080, iSuper, state, cb, null, null);
-            DynamicState dynamicState = new DynamicState(null, null, null);
+                containerLauncher, "localhost", 8080, iSuper, state, cb, null, null,
+                slotMetrics);
+            DynamicState dynamicState = new DynamicState(null, null, null, slotMetrics);
             DynamicState nextState = Slot.handleEmpty(dynamicState, staticState);
             assertEquals(MachineState.EMPTY, nextState.state);
             assertTrue(Time.currentTimeMillis() > 1000);
@@ -179,9 +250,10 @@ public class SlotTest {
             when(localizer.requestDownloadTopologyBlobs(newAssignment, port, cb)).thenReturn(blobFuture);
 
             ISupervisor iSuper = mock(ISupervisor.class);
+            SlotMetrics slotMetrics = new SlotMetrics(new StormMetricsRegistry());
             StaticState staticState = new StaticState(localizer, 5000, 120000, 1000, 1000,
-                                                      containerLauncher, "localhost", port, iSuper, state, cb, null, null);
-            DynamicState dynamicState = new DynamicState(null, null, null)
+                                                      containerLauncher, "localhost", port, iSuper, state, cb, null, null, slotMetrics);
+            DynamicState dynamicState = new DynamicState(null, null, null, slotMetrics)
                 .withNewAssignment(newAssignment);
 
             DynamicState nextState = Slot.stateMachineStep(dynamicState, staticState);
@@ -226,7 +298,83 @@ public class SlotTest {
             assertTrue(Time.currentTimeMillis() > 2000);
         }
     }
+    
+    @Test
+    public void testErrorHandlingWhenLocalizationFails() throws Exception {
+        try (SimulatedTime t = new SimulatedTime(1010)) {
+            int port = 8080;
+            String topoId = "NEW";
+            List<ExecutorInfo> execList = mkExecutorInfoList(1, 2, 3, 4, 5);
+            LocalAssignment newAssignment =
+                mkLocalAssignment(topoId, execList, mkWorkerResources(100.0, 100.0, 100.0));
 
+            AsyncLocalizer localizer = mock(AsyncLocalizer.class);
+            BlobChangingCallback cb = mock(BlobChangingCallback.class);
+            Container container = mock(Container.class);
+            LocalState state = mock(LocalState.class);
+            ContainerLauncher containerLauncher = mock(ContainerLauncher.class);
+            when(containerLauncher.launchContainer(port, newAssignment, state)).thenReturn(container);
+            LSWorkerHeartbeat hb = mkWorkerHB(topoId, port, execList, Time.currentTimeSecs());
+            when(container.readHeartbeat()).thenReturn(hb, hb);
+
+            @SuppressWarnings("unchecked")
+            CompletableFuture<Void> blobFuture = mock(CompletableFuture.class);
+            CompletableFuture<Void> secondBlobFuture = mock(CompletableFuture.class);
+            when(secondBlobFuture.get(anyLong(), any())).thenThrow(new ExecutionException(new RuntimeException("Localization failure")));
+            CompletableFuture<Void> thirdBlobFuture = mock(CompletableFuture.class);
+            when(localizer.requestDownloadTopologyBlobs(newAssignment, port, cb))
+                .thenReturn(blobFuture)
+                .thenReturn(secondBlobFuture)
+                .thenReturn(thirdBlobFuture);
+
+            ISupervisor iSuper = mock(ISupervisor.class);
+            SlotMetrics slotMetrics = new SlotMetrics(new StormMetricsRegistry());
+            StaticState staticState = new StaticState(localizer, 5000, 120000, 1000, 1000,
+                                                      containerLauncher, "localhost", port, iSuper, state, cb, null, null, slotMetrics);
+            DynamicState dynamicState = new DynamicState(null, null, null, slotMetrics)
+                .withNewAssignment(newAssignment);
+
+            DynamicState nextState = Slot.stateMachineStep(dynamicState, staticState);
+            verify(localizer).requestDownloadTopologyBlobs(newAssignment, port, cb);
+            assertEquals(MachineState.WAITING_FOR_BLOB_LOCALIZATION, nextState.state);
+            assertSame("pendingDownload not set properly", blobFuture, nextState.pendingDownload);
+            assertEquals(newAssignment, nextState.pendingLocalization);
+            assertEquals(0, Time.currentTimeMillis());
+
+            //Assignment has changed
+            nextState = Slot.stateMachineStep(nextState.withNewAssignment(null), staticState);
+            assertThat(nextState.state, is(MachineState.EMPTY));
+            assertThat(nextState.pendingChangingBlobs, is(Collections.emptySet()));
+            assertThat(nextState.pendingChangingBlobsAssignment, nullValue());
+            assertThat(nextState.pendingLocalization, nullValue());
+            assertThat(nextState.pendingDownload, nullValue());
+            
+            clearInvocations(localizer);
+            nextState = Slot.stateMachineStep(dynamicState.withNewAssignment(newAssignment), staticState);
+            verify(localizer).requestDownloadTopologyBlobs(newAssignment, port, cb);
+            assertEquals(MachineState.WAITING_FOR_BLOB_LOCALIZATION, nextState.state);
+            assertSame("pendingDownload not set properly", secondBlobFuture, nextState.pendingDownload);
+            assertEquals(newAssignment, nextState.pendingLocalization);
+            
+            //Error occurs, but assignment has not changed
+            clearInvocations(localizer);
+            nextState = Slot.stateMachineStep(nextState, staticState);
+            verify(localizer).requestDownloadTopologyBlobs(newAssignment, port, cb);
+            assertEquals(MachineState.WAITING_FOR_BLOB_LOCALIZATION, nextState.state);
+            assertSame("pendingDownload not set properly", thirdBlobFuture, nextState.pendingDownload);
+            assertEquals(newAssignment, nextState.pendingLocalization);
+            assertThat(Time.currentTimeMillis(), greaterThan(3L));
+
+            nextState = Slot.stateMachineStep(nextState, staticState);
+            verify(thirdBlobFuture).get(1000, TimeUnit.MILLISECONDS);
+            verify(containerLauncher).launchContainer(port, newAssignment, state);
+            assertEquals(MachineState.WAITING_FOR_WORKER_START, nextState.state);
+            assertSame("pendingDownload is not null", null, nextState.pendingDownload);
+            assertSame(null, nextState.pendingLocalization);
+            assertSame(newAssignment, nextState.currentAssignment);
+            assertSame(container, nextState.container);
+        }
+    }
 
     @Test
     public void testRelaunch() throws Exception {
@@ -248,9 +396,10 @@ public class SlotTest {
 
             ISupervisor iSuper = mock(ISupervisor.class);
             LocalState state = mock(LocalState.class);
+            SlotMetrics slotMetrics = new SlotMetrics(new StormMetricsRegistry());
             StaticState staticState = new StaticState(localizer, 5000, 120000, 1000, 1000,
-                                                      containerLauncher, "localhost", port, iSuper, state, cb, null, null);
-            DynamicState dynamicState = new DynamicState(assignment, container, assignment);
+                                                      containerLauncher, "localhost", port, iSuper, state, cb, null, null, slotMetrics);
+            DynamicState dynamicState = new DynamicState(assignment, container, assignment, slotMetrics);
 
             DynamicState nextState = Slot.stateMachineStep(dynamicState, staticState);
             assertEquals(MachineState.KILL_AND_RELAUNCH, nextState.state);
@@ -309,9 +458,10 @@ public class SlotTest {
             when(localizer.requestDownloadTopologyBlobs(nAssignment, port, cb)).thenReturn(blobFuture);
 
             ISupervisor iSuper = mock(ISupervisor.class);
+            SlotMetrics slotMetrics = new SlotMetrics(new StormMetricsRegistry());
             StaticState staticState = new StaticState(localizer, 5000, 120000, 1000, 1000,
-                                                      containerLauncher, "localhost", port, iSuper, state, cb, null, null);
-            DynamicState dynamicState = new DynamicState(cAssignment, cContainer, nAssignment);
+                                                      containerLauncher, "localhost", port, iSuper, state, cb, null, null, slotMetrics);
+            DynamicState dynamicState = new DynamicState(cAssignment, cContainer, nAssignment, slotMetrics);
 
             DynamicState nextState = Slot.stateMachineStep(dynamicState, staticState);
             assertEquals(MachineState.KILL, nextState.state);
@@ -390,9 +540,10 @@ public class SlotTest {
 
             ISupervisor iSuper = mock(ISupervisor.class);
             LocalState state = mock(LocalState.class);
+            SlotMetrics slotMetrics = new SlotMetrics(new StormMetricsRegistry());
             StaticState staticState = new StaticState(localizer, 5000, 120000, 1000, 1000,
-                                                      containerLauncher, "localhost", port, iSuper, state, cb, null, null);
-            DynamicState dynamicState = new DynamicState(cAssignment, cContainer, null);
+                                                      containerLauncher, "localhost", port, iSuper, state, cb, null, null, slotMetrics);
+            DynamicState dynamicState = new DynamicState(cAssignment, cContainer, null, slotMetrics);
 
             DynamicState nextState = Slot.stateMachineStep(dynamicState, staticState);
             assertEquals(MachineState.KILL, nextState.state);
@@ -452,7 +603,7 @@ public class SlotTest {
             ISupervisor iSuper = mock(ISupervisor.class);
             LocalState state = mock(LocalState.class);
             StaticState staticState = new StaticState(localizer, 5000, 120000, 1000, 1000,
-                                                      containerLauncher, "localhost", port, iSuper, state, cb, null, null);
+                                                      containerLauncher, "localhost", port, iSuper, state, cb, null, null, new SlotMetrics(new StormMetricsRegistry()));
             Set<TopoProfileAction> profileActions = new HashSet<>();
             ProfileRequest request = new ProfileRequest();
             request.set_action(ProfileAction.JPROFILE_STOP);
@@ -467,8 +618,8 @@ public class SlotTest {
             Set<TopoProfileAction> expectedPending = new HashSet<>();
             expectedPending.add(profile);
 
-
-            DynamicState dynamicState = new DynamicState(cAssignment, cContainer, cAssignment)
+            SlotMetrics slotMetrics = new SlotMetrics(new StormMetricsRegistry());
+            DynamicState dynamicState = new DynamicState(cAssignment, cContainer, cAssignment, slotMetrics)
                 .withProfileActions(profileActions, Collections.<TopoProfileAction>emptySet());
 
             DynamicState nextState = Slot.stateMachineStep(dynamicState, staticState);
@@ -534,7 +685,7 @@ public class SlotTest {
             ISupervisor iSuper = mock(ISupervisor.class);
             long heartbeatTimeoutMs = 5000;
             StaticState staticState = new StaticState(localizer, heartbeatTimeoutMs, 120_000, 1000, 1000,
-                                                      containerLauncher, "localhost", port, iSuper, state, cb, null, null);
+                                                      containerLauncher, "localhost", port, iSuper, state, cb, null, null, new SlotMetrics(new StormMetricsRegistry()));
 
             Set<Slot.BlobChanging> changing = new HashSet<>();
 
@@ -549,7 +700,8 @@ public class SlotTest {
             GoodToGo.GoodToGoLatch otherJarLatch = mock(GoodToGo.GoodToGoLatch.class);
             changing.add(new Slot.BlobChanging(otherAssignment, otherJar, otherJarLatch));
 
-            DynamicState dynamicState = new DynamicState(cAssignment, cContainer, cAssignment).withChangingBlobs(changing);
+            SlotMetrics slotMetrics = new SlotMetrics(new StormMetricsRegistry());
+            DynamicState dynamicState = new DynamicState(cAssignment, cContainer, cAssignment, slotMetrics).withChangingBlobs(changing);
 
             DynamicState nextState = Slot.stateMachineStep(dynamicState, staticState);
             assertEquals(MachineState.KILL_BLOB_UPDATE, nextState.state);

@@ -20,7 +20,6 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ThreadLocalRandom;
-import org.apache.http.annotation.NotThreadSafe;
 import org.apache.storm.metricstore.AggLevel;
 import org.apache.storm.metricstore.Metric;
 import org.apache.storm.metricstore.MetricException;
@@ -34,7 +33,7 @@ import org.slf4j.LoggerFactory;
 /**
  * Class designed to perform all metrics inserts into RocksDB.  Metrics are processed from a blocking queue.  Inserts
  * to RocksDB are done using a single thread to simplify design (such as looking up existing metric data for aggregation,
- * and fetching/evicting metadata from the cache).
+ * and fetching/evicting metadata from the cache).  This class is not thread safe.
  * </P>
  * A writable LRU StringMetadataCache is used to minimize looking up metadata string Ids.  As entries are added to the full cache, older
  * entries are evicted from the cache and need to be written to the database.  This happens as the handleEvictedMetadata()
@@ -51,7 +50,6 @@ import org.slf4j.LoggerFactory;
  *     <li>Investigate performance of multiple threads inserting into RocksDB versus a single ordered insert.</li>
  * </ul>
  */
-@NotThreadSafe
 public class RocksDbMetricsWriter implements Runnable, AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(RocksDbMetricsWriter.class);
     private RocksDbStore store;
@@ -184,7 +182,11 @@ public class RocksDbMetricsWriter implements Runnable, AutoCloseable {
         }
 
         // attempt to find the string in the database
-        stringMetadata = store.rocksDbGetStringMetadata(type, s);
+        try {
+            stringMetadata = store.rocksDbGetStringMetadata(type, s);
+        } catch (RocksDBException e) {
+            throw new MetricException("Error reading metrics data", e);
+        }
         if (stringMetadata != null) {
             // update to the latest timestamp and add to the string cache
             stringMetadata.update(metricTimestamp, type);
@@ -236,10 +238,14 @@ public class RocksDbMetricsWriter implements Runnable, AutoCloseable {
             // now scan all metadata and remove any matching string Ids from this list
             RocksDbKey firstPrefix = RocksDbKey.getPrefix(KeyType.METADATA_STRING_START);
             RocksDbKey lastPrefix = RocksDbKey.getPrefix(KeyType.METADATA_STRING_END);
-            store.scanRange(firstPrefix, lastPrefix, (key, value) -> {
-                unusedIds.remove(key.getMetadataStringId());
-                return true; // process all metadata
-            });
+            try {
+                store.scanRange(firstPrefix, lastPrefix, (key, value) -> {
+                    unusedIds.remove(key.getMetadataStringId());
+                    return true; // process all metadata
+                });
+            } catch (RocksDBException e) {
+                throw new MetricException("Error reading metrics data", e);
+            }
         }
     }
 

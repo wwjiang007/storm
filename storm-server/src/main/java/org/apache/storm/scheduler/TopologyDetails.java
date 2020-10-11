@@ -26,8 +26,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import org.apache.storm.Config;
-import org.apache.storm.Constants;
-import org.apache.storm.daemon.Acker;
 import org.apache.storm.generated.Bolt;
 import org.apache.storm.generated.ComponentCommon;
 import org.apache.storm.generated.ComponentType;
@@ -125,6 +123,15 @@ public class TopologyDetails {
         return ret;
     }
 
+    public Map<String, Set<ExecutorDetails>> getComponentToExecutors() {
+        Map<String, Set<ExecutorDetails>> ret = new HashMap<>();
+        Map<ExecutorDetails, String> execToComp = getExecutorToComponent();
+        if (execToComp != null) {
+            execToComp.forEach((exec, comp) -> ret.computeIfAbsent(comp, (k) -> new HashSet<>()).add(exec));
+        }
+        return ret;
+    }
+
     public Set<ExecutorDetails> getExecutors() {
         return executorToComponent.keySet();
     }
@@ -209,8 +216,9 @@ public class TopologyDetails {
         if (spouts != null) {
             for (Map.Entry<String, SpoutSpec> entry : spouts.entrySet()) {
                 String compId = entry.getKey();
+                SpoutSpec spout = entry.getValue();
                 if (!Utils.isSystemId(compId)) {
-                    Component comp = new Component(ComponentType.SPOUT, compId, componentToExecs(compId));
+                    Component comp = new Component(ComponentType.SPOUT, compId, componentToExecs(compId), spout.get_common().get_inputs());
                     ret.put(compId, comp);
                 }
             }
@@ -218,8 +226,9 @@ public class TopologyDetails {
         if (bolts != null) {
             for (Map.Entry<String, Bolt> entry : bolts.entrySet()) {
                 String compId = entry.getKey();
+                Bolt bolt = entry.getValue();
                 if (!Utils.isSystemId(compId)) {
-                    Component comp = new Component(ComponentType.BOLT, compId, componentToExecs(compId));
+                    Component comp = new Component(ComponentType.BOLT, compId, componentToExecs(compId), bolt.get_common().get_inputs());
                     ret.put(compId, comp);
                 }
             }
@@ -244,6 +253,28 @@ public class TopologyDetails {
             }
         }
         return ret;
+    }
+
+    /**
+     * Determine if there are non-system spouts.
+     *
+     * @return true if there is at least one non-system spout, false otherwise
+     */
+    public boolean hasSpouts() {
+        Map<String, SpoutSpec> spouts = topology.get_spouts();
+        if (spouts == null) {
+            return false;
+        }
+        for (String compId : spouts.keySet()) {
+            if (!Utils.isSystemId(compId)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public String getComponentFromExecutor(ExecutorDetails exec) {
+        return executorToComponent.get(exec);
     }
 
     /**
@@ -340,15 +371,39 @@ public class TopologyDetails {
     }
 
     /**
+     * Get an approximate total resources needed for this topology. ignores shared memory.
+     * @return the approximate total resources needed for this topology.
+     */
+    public NormalizedResourceRequest getApproximateTotalResources() {
+        NormalizedResourceRequest ret = new NormalizedResourceRequest();
+        for (NormalizedResourceRequest resources : resourceList.values()) {
+            ret.add(resources);
+        }
+        return ret;
+    }
+
+    /**
+     * Get approximate resources for given topology executors. ignores shared memory.
+     *
+     * @param execs the executors the inquiry is concerning.
+     * @return the approximate resources for the executors.
+     */
+    public NormalizedResourceRequest getApproximateResources(Set<ExecutorDetails> execs) {
+        NormalizedResourceRequest ret = new NormalizedResourceRequest();
+        execs.stream()
+            .filter(x -> hasExecInTopo(x))
+            .forEach(x -> ret.add(resourceList.get(x)));
+        return ret;
+    }
+
+    /**
      * Get the total CPU requirement for executor.
      *
-     * @param exec
-     * @return Map<String   ,       Double> generic resource mapping requirement for the executor
+     * @return generic resource mapping requirement for the executor
      */
     public Double getTotalCpuReqTask(ExecutorDetails exec) {
         if (hasExecInTopo(exec)) {
-            return resourceList
-                .get(exec).getTotalCpu();
+            return resourceList.get(exec).getTotalCpu();
         }
         return null;
     }
@@ -427,6 +482,12 @@ public class TopologyDetails {
             }
         }
         return totalCpu;
+    }
+
+    public Map<String, Double> getTotalRequestedGenericResources() {
+        Map<String, Double> map = getApproximateTotalResources().toNormalizedMap();
+        NormalizedResourceRequest.removeNonGenericResources(map);
+        return map;
     }
 
     /**

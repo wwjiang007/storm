@@ -24,6 +24,7 @@ import org.apache.storm.Config;
 import org.apache.storm.DaemonConfig;
 import org.apache.storm.container.ResourceIsolationInterface;
 import org.apache.storm.daemon.supervisor.Container.ContainerType;
+import org.apache.storm.daemon.supervisor.ContainerTest.MockResourceIsolationManager;
 import org.apache.storm.generated.LocalAssignment;
 import org.apache.storm.generated.ProfileAction;
 import org.apache.storm.generated.ProfileRequest;
@@ -41,6 +42,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import org.apache.storm.metric.StormMetricsRegistry;
 import org.apache.storm.utils.ConfigUtils;
 
 public class BasicContainerTest {
@@ -101,15 +103,17 @@ public class BasicContainerTest {
 
         LocalState ls = mock(LocalState.class);
 
+        ResourceIsolationInterface iso = mock(ResourceIsolationInterface.class);
+
         MockBasicContainer mc = new MockBasicContainer(ContainerType.LAUNCH, superConf,
-                                                       "SUPERVISOR", supervisorPort, port, la, null, ls, null, new HashMap<>(), ops,
-                                                       "profile");
+            "SUPERVISOR", supervisorPort, port, la, iso, ls, null, new StormMetricsRegistry(),
+            new HashMap<>(), ops, "profile");
         //null worker id means generate one...
 
-        assertNotNull(mc._workerId);
+        assertNotNull(mc.workerId);
         verify(ls).getApprovedWorkers();
         Map<String, Integer> expectedNewState = new HashMap<String, Integer>();
-        expectedNewState.put(mc._workerId, port);
+        expectedNewState.put(mc.workerId, port);
         verify(ls).setApprovedWorkers(expectedNewState);
     }
 
@@ -132,11 +136,13 @@ public class BasicContainerTest {
         AdvancedFSOps ops = mock(AdvancedFSOps.class);
         when(ops.doRequiredTopoFilesExist(superConf, topoId)).thenReturn(true);
 
-        MockBasicContainer mc = new MockBasicContainer(ContainerType.RECOVER_FULL, superConf,
-                                                       "SUPERVISOR", supervisorPort, port, la, null, ls, null, new HashMap<>(), ops,
-                                                       "profile");
+        ResourceIsolationInterface iso = mock(ResourceIsolationInterface.class);
 
-        assertEquals(workerId, mc._workerId);
+        MockBasicContainer mc = new MockBasicContainer(ContainerType.RECOVER_FULL, superConf,
+            "SUPERVISOR", supervisorPort, port, la, iso, ls, null, new StormMetricsRegistry(),
+            new HashMap<>(), ops, "profile");
+
+        assertEquals(workerId, mc.workerId);
     }
 
     @Test
@@ -155,7 +161,8 @@ public class BasicContainerTest {
 
         try {
             new MockBasicContainer(ContainerType.RECOVER_FULL, new HashMap<String, Object>(),
-                                   "SUPERVISOR", supervisorPort, port, la, null, ls, null, new HashMap<>(), null, "profile");
+                "SUPERVISOR", supervisorPort, port, la, null, ls, null, new StormMetricsRegistry(),
+                new HashMap<>(), null, "profile");
             fail("Container recovered worker incorrectly");
         } catch (ContainerRecoveryException e) {
             //Expected
@@ -181,13 +188,15 @@ public class BasicContainerTest {
         LocalState ls = mock(LocalState.class);
         when(ls.getApprovedWorkers()).thenReturn(new HashMap<>(workerState));
 
+        ResourceIsolationInterface iso = mock(ResourceIsolationInterface.class);
+
         MockBasicContainer mc = new MockBasicContainer(ContainerType.LAUNCH, superConf,
-                                                       "SUPERVISOR", supervisorPort, port, la, null, ls, workerId, new HashMap<>(), ops,
+            "SUPERVISOR", supervisorPort, port, la, iso, ls, workerId, new StormMetricsRegistry(), new HashMap<>(), ops,
                                                        "profile");
 
         mc.cleanUp();
 
-        assertNull(mc._workerId);
+        assertNull(mc.workerId);
         verify(ls).getApprovedWorkers();
         Map<String, Integer> expectedNewState = new HashMap<String, Integer>();
         verify(ls).setApprovedWorkers(expectedNewState);
@@ -217,9 +226,11 @@ public class BasicContainerTest {
 
         LocalState ls = mock(LocalState.class);
 
+        MockResourceIsolationManager iso = new MockResourceIsolationManager();
+
         MockBasicContainer mc = new MockBasicContainer(ContainerType.LAUNCH, superConf,
-                                                       "SUPERVISOR", supervisorPort, port, la, null, ls, workerId, new HashMap<>(), ops,
-                                                       "profile");
+            "SUPERVISOR", supervisorPort, port, la, iso, ls, workerId, new StormMetricsRegistry(),
+            new HashMap<>(), ops, "profile");
 
         //HEAP DUMP
         ProfileRequest req = new ProfileRequest();
@@ -227,9 +238,9 @@ public class BasicContainerTest {
 
         mc.runProfiling(req, false);
 
-        assertEquals(1, mc.profileCmds.size());
-        CommandRun cmd = mc.profileCmds.get(0);
-        mc.profileCmds.clear();
+        assertEquals(1, iso.profileCmds.size());
+        CommandRun cmd = iso.profileCmds.get(0);
+        iso.profileCmds.clear();
         assertEquals(Arrays.asList("profile", String.valueOf(pid), "jmap", topoRoot), cmd.cmd);
         assertEquals(new File(topoRoot), cmd.pwd);
 
@@ -238,9 +249,9 @@ public class BasicContainerTest {
 
         mc.runProfiling(req, false);
 
-        assertEquals(1, mc.profileCmds.size());
-        cmd = mc.profileCmds.get(0);
-        mc.profileCmds.clear();
+        assertEquals(1, iso.profileCmds.size());
+        cmd = iso.profileCmds.get(0);
+        iso.profileCmds.clear();
         assertEquals(Arrays.asList("profile", String.valueOf(pid), "jstack", topoRoot), cmd.cmd);
         assertEquals(new File(topoRoot), cmd.pwd);
 
@@ -249,9 +260,9 @@ public class BasicContainerTest {
 
         mc.runProfiling(req, false);
 
-        assertEquals(1, mc.profileCmds.size());
-        cmd = mc.profileCmds.get(0);
-        mc.profileCmds.clear();
+        assertEquals(1, iso.profileCmds.size());
+        cmd = iso.profileCmds.get(0);
+        iso.profileCmds.clear();
         assertEquals(Arrays.asList("profile", String.valueOf(pid), "kill"), cmd.cmd);
         assertEquals(new File(topoRoot), cmd.pwd);
 
@@ -260,9 +271,9 @@ public class BasicContainerTest {
 
         mc.runProfiling(req, false);
 
-        assertEquals(1, mc.profileCmds.size());
-        cmd = mc.profileCmds.get(0);
-        mc.profileCmds.clear();
+        assertEquals(1, iso.profileCmds.size());
+        cmd = iso.profileCmds.get(0);
+        iso.profileCmds.clear();
         assertEquals(Arrays.asList("profile", String.valueOf(pid), "dump", topoRoot), cmd.cmd);
         assertEquals(new File(topoRoot), cmd.pwd);
 
@@ -271,9 +282,9 @@ public class BasicContainerTest {
 
         mc.runProfiling(req, false);
 
-        assertEquals(1, mc.profileCmds.size());
-        cmd = mc.profileCmds.get(0);
-        mc.profileCmds.clear();
+        assertEquals(1, iso.profileCmds.size());
+        cmd = iso.profileCmds.get(0);
+        iso.profileCmds.clear();
         assertEquals(Arrays.asList("profile", String.valueOf(pid), "start"), cmd.cmd);
         assertEquals(new File(topoRoot), cmd.pwd);
 
@@ -282,9 +293,9 @@ public class BasicContainerTest {
 
         mc.runProfiling(req, true);
 
-        assertEquals(1, mc.profileCmds.size());
-        cmd = mc.profileCmds.get(0);
-        mc.profileCmds.clear();
+        assertEquals(1, iso.profileCmds.size());
+        cmd = iso.profileCmds.get(0);
+        iso.profileCmds.clear();
         assertEquals(Arrays.asList("profile", String.valueOf(pid), "stop", topoRoot), cmd.cmd);
         assertEquals(new File(topoRoot), cmd.pwd);
     }
@@ -327,17 +338,18 @@ public class BasicContainerTest {
 
         LocalState ls = mock(LocalState.class);
 
+        MockResourceIsolationManager iso = new MockResourceIsolationManager();
+
         checkpoint(() -> {
                        MockBasicContainer mc = new MockBasicContainer(ContainerType.LAUNCH, superConf,
-                                                                      "SUPERVISOR", supervisorPort, port, la, null, ls, workerId, new
-                                                                          HashMap<>(), ops,
-                                                                      "profile");
+                "SUPERVISOR", supervisorPort, port, la, iso, ls, workerId, new StormMetricsRegistry(),
+                new HashMap<>(), ops, "profile");
 
                        mc.launch();
 
-                       assertEquals(1, mc.workerCmds.size());
-                       CommandRun cmd = mc.workerCmds.get(0);
-                       mc.workerCmds.clear();
+                       assertEquals(1, iso.workerCmds.size());
+                       CommandRun cmd = iso.workerCmds.get(0);
+                       iso.workerCmds.clear();
                        assertListEquals(Arrays.asList(
                            "java",
                            "-cp",
@@ -350,10 +362,10 @@ public class BasicContainerTest {
                            "-Dworker.id=" + workerId,
                            "-Dworker.port=" + port,
                            "-Dstorm.log.dir=" + stormLogDir,
-                           "-Dlog4j.configurationFile=" + workerConf,
                            "-DLog4jContextSelector=org.apache.logging.log4j.core.selector.BasicContextSelector",
                            "-Dstorm.local.dir=" + stormLocal,
                            "-Dworker.memory_limit_mb=768",
+                           "-Dlog4j.configurationFile=" + workerConf,
                            "org.apache.storm.LogWriter",
                            "java",
                            "-server",
@@ -365,10 +377,10 @@ public class BasicContainerTest {
                            "-Dworker.id=" + workerId,
                            "-Dworker.port=" + port,
                            "-Dstorm.log.dir=" + stormLogDir,
-                           "-Dlog4j.configurationFile=" + workerConf,
                            "-DLog4jContextSelector=org.apache.logging.log4j.core.selector.BasicContextSelector",
                            "-Dstorm.local.dir=" + stormLocal,
                            "-Dworker.memory_limit_mb=768",
+                           "-Dlog4j.configurationFile=" + workerConf,
                            "-Dtesting=true",
                            "-Djava.library.path=JLP",
                            "-Dstorm.conf.file=",
@@ -430,17 +442,18 @@ public class BasicContainerTest {
 
         LocalState ls = mock(LocalState.class);
 
+        MockResourceIsolationManager iso = new MockResourceIsolationManager();
+
         checkpoint(() -> {
                        MockBasicContainer mc = new MockBasicContainer(ContainerType.LAUNCH, superConf,
-                                                                      "SUPERVISOR", supervisorPort, port, la, null, ls, workerId, new
-                                                                          HashMap<>(), ops,
-                                                                      "profile");
+                "SUPERVISOR", supervisorPort, port, la, iso, ls, workerId, new StormMetricsRegistry(),
+                new HashMap<>(), ops, "profile");
 
                        mc.launch();
 
-                       assertEquals(1, mc.workerCmds.size());
-                       CommandRun cmd = mc.workerCmds.get(0);
-                       mc.workerCmds.clear();
+                       assertEquals(1, iso.workerCmds.size());
+                       CommandRun cmd = iso.workerCmds.get(0);
+                       iso.workerCmds.clear();
                        assertListEquals(Arrays.asList(
                            "java",
                            "-cp",
@@ -453,10 +466,10 @@ public class BasicContainerTest {
                            "-Dworker.id=" + workerId,
                            "-Dworker.port=" + port,
                            "-Dstorm.log.dir=" + stormLogDir,
-                           "-Dlog4j.configurationFile=" + workerConf,
                            "-DLog4jContextSelector=org.apache.logging.log4j.core.selector.BasicContextSelector",
                            "-Dstorm.local.dir=" + stormLocal,
                            "-Dworker.memory_limit_mb=768",
+                           "-Dlog4j.configurationFile=" + workerConf,
                            "org.apache.storm.LogWriter",
                            "java",
                            "-server",
@@ -468,10 +481,10 @@ public class BasicContainerTest {
                            "-Dworker.id=" + workerId,
                            "-Dworker.port=" + port,
                            "-Dstorm.log.dir=" + stormLogDir,
-                           "-Dlog4j.configurationFile=" + workerConf,
                            "-DLog4jContextSelector=org.apache.logging.log4j.core.selector.BasicContextSelector",
                            "-Dstorm.local.dir=" + stormLocal,
                            "-Dworker.memory_limit_mb=768",
+                           "-Dlog4j.configurationFile=" + workerConf,
                            "-Dtesting=true",
                            "-Djava.library.path=JLP",
                            "-Dstorm.conf.file=",
@@ -532,17 +545,18 @@ public class BasicContainerTest {
 
         LocalState ls = mock(LocalState.class);
 
+        MockResourceIsolationManager iso = new MockResourceIsolationManager();
+
         checkpoint(() -> {
                        MockBasicContainer mc = new MockBasicContainer(ContainerType.LAUNCH, superConf,
-                                                                      "SUPERVISOR", supervisorPort, port, la, null, ls, workerId, new
-                                                                          HashMap<>(), ops,
-                                                                      "profile");
+                "SUPERVISOR", supervisorPort, port, la, iso, ls, workerId, new StormMetricsRegistry(),
+                new HashMap<>(), ops, "profile");
 
                        mc.launch();
 
-                       assertEquals(1, mc.workerCmds.size());
-                       CommandRun cmd = mc.workerCmds.get(0);
-                       mc.workerCmds.clear();
+                       assertEquals(1, iso.workerCmds.size());
+                       CommandRun cmd = iso.workerCmds.get(0);
+                       iso.workerCmds.clear();
                        assertListEquals(Arrays.asList(
                            "java",
                            "-cp",
@@ -555,10 +569,10 @@ public class BasicContainerTest {
                            "-Dworker.id=" + workerId,
                            "-Dworker.port=" + port,
                            "-Dstorm.log.dir=" + stormLogDir,
-                           "-Dlog4j.configurationFile=" + workerConf,
                            "-DLog4jContextSelector=org.apache.logging.log4j.core.selector.BasicContextSelector",
                            "-Dstorm.local.dir=" + stormLocal,
                            "-Dworker.memory_limit_mb=768",
+                           "-Dlog4j.configurationFile=" + workerConf,
                            "backtype.storm.LogWriter",
                            "java",
                            "-server",
@@ -570,10 +584,10 @@ public class BasicContainerTest {
                            "-Dworker.id=" + workerId,
                            "-Dworker.port=" + port,
                            "-Dstorm.log.dir=" + stormLogDir,
-                           "-Dlog4j.configurationFile=" + workerConf,
                            "-DLog4jContextSelector=org.apache.logging.log4j.core.selector.BasicContextSelector",
                            "-Dstorm.local.dir=" + stormLocal,
                            "-Dworker.memory_limit_mb=768",
+                           "-Dlog4j.configurationFile=" + workerConf,
                            "-Dtesting=true",
                            "-Djava.library.path=JLP",
                            "-Dstorm.conf.file=",
@@ -600,6 +614,7 @@ public class BasicContainerTest {
         int supervisorPort = 6628;
         int port = 9999;
         int memOnheap = 512;
+        int memOffheap = 256;
 
         LocalAssignment la = new LocalAssignment();
         la.set_topology_id(topoId);
@@ -611,32 +626,40 @@ public class BasicContainerTest {
 
         LocalState ls = mock(LocalState.class);
 
+        ResourceIsolationInterface iso = mock(ResourceIsolationInterface.class);
+
         MockBasicContainer mc = new MockBasicContainer(ContainerType.LAUNCH, superConf,
-                                                       "SUPERVISOR", supervisorPort, port, la, null, ls, workerId, new HashMap<>(), ops,
-                                                       "profile");
+            "SUPERVISOR", supervisorPort, port, la, iso, ls, workerId, new StormMetricsRegistry(),
+            new HashMap<>(), ops, "profile");
 
         assertListEquals(Arrays.asList(
             "-Xloggc:/tmp/storm/logs/gc.worker-9999-s-01-w-01-9999.log",
             "-Xms256m",
-            "-Xmx512m"),
-                         mc.substituteChildopts(
-                             "-Xloggc:/tmp/storm/logs/gc.worker-%ID%-%TOPOLOGY-ID%-%WORKER-ID%-%WORKER-PORT%.log -Xms256m -Xmx%HEAP-MEM%m",
-                             memOnheap));
+                "-Xmx512m", "-XX:MaxDirectMemorySize=256m"),
+                mc.substituteChildopts(
+                        "-Xloggc:/tmp/storm/logs/gc.worker-%ID%-%TOPOLOGY-ID%-%WORKER-ID%-%WORKER-PORT%.log -Xms256m -Xmx%HEAP-MEM%m -XX:MaxDirectMemorySize=%OFF-HEAP-MEM%m",
+                        memOnheap, memOffheap));
 
-        assertListEquals(Arrays.asList(
-            "-Xloggc:/tmp/storm/logs/gc.worker-9999-s-01-w-01-9999.log",
-            "-Xms256m",
-            "-Xmx512m"),
-                         mc.substituteChildopts(Arrays.asList(
-                             "-Xloggc:/tmp/storm/logs/gc.worker-%ID%-%TOPOLOGY-ID%-%WORKER-ID%-%WORKER-PORT%.log", "-Xms256m",
-                             "-Xmx%HEAP-MEM%m"), memOnheap));
+        assertListEquals(
+                Arrays.asList(
+                        "-Xloggc:/tmp/storm/logs/gc.worker-9999-s-01-w-01-9999.log",
+                        "-Xms256m",
+                        "-Xmx512m"
+                ),
+                mc.substituteChildopts(
+                        Arrays.asList(
+                        "-Xloggc:/tmp/storm/logs/gc.worker-%ID%-%TOPOLOGY-ID%-%WORKER-ID%-%WORKER-PORT%.log", "-Xms256m",
+                        "-Xmx%HEAP-MEM%m"
+                        ), memOnheap, memOffheap
+                )
+        );
 
         assertListEquals(Collections.emptyList(),
                          mc.substituteChildopts(null));
     }
 
-    private static interface Run {
-        public void run() throws Exception;
+    private interface Run {
+        void run() throws Exception;
     }
 
     public static class CommandRun {
@@ -652,14 +675,12 @@ public class BasicContainerTest {
     }
 
     public static class MockBasicContainer extends BasicContainer {
-        public final List<CommandRun> profileCmds = new ArrayList<>();
-        public final List<CommandRun> workerCmds = new ArrayList<>();
         public MockBasicContainer(ContainerType type, Map<String, Object> conf, String supervisorId, int supervisorPort,
                                   int port, LocalAssignment assignment, ResourceIsolationInterface resourceIsolationManager,
-                                  LocalState localState, String workerId, Map<String, Object> topoConf, AdvancedFSOps ops,
-                                  String profileCmd) throws IOException {
+                                  LocalState localState, String workerId, StormMetricsRegistry metricsRegistry, 
+                                  Map<String, Object> topoConf, AdvancedFSOps ops, String profileCmd) throws IOException {
             super(type, conf, supervisorId, supervisorPort, port, assignment, resourceIsolationManager, localState,
-                  workerId, topoConf, ops, profileCmd);
+                  workerId, metricsRegistry,new ContainerMemoryTracker(metricsRegistry), topoConf, ops, profileCmd);
         }
 
         @Override
@@ -673,21 +694,8 @@ public class BasicContainerTest {
         }
 
         @Override
-        public List<String> substituteChildopts(Object value, int memOnheap) {
-            return super.substituteChildopts(value, memOnheap);
-        }
-
-        @Override
-        protected boolean runProfilingCommand(List<String> command, Map<String, String> env, String logPrefix,
-                                              File targetDir) throws IOException, InterruptedException {
-            profileCmds.add(new CommandRun(command, env, targetDir));
-            return true;
-        }
-
-        @Override
-        protected void launchWorkerProcess(List<String> command, Map<String, String> env, String logPrefix,
-                                           ExitCodeCallback processExitCallback, File targetDir) throws IOException {
-            workerCmds.add(new CommandRun(command, env, targetDir));
+        public List<String> substituteChildopts(Object value, int memOnheap, int memOffHeap) {
+            return super.substituteChildopts(value, memOnheap, memOffHeap);
         }
 
         @Override

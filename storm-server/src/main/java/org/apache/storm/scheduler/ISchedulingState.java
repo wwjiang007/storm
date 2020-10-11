@@ -19,9 +19,11 @@
 package org.apache.storm.scheduler;
 
 import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+
 import org.apache.storm.daemon.nimbus.TopologyResources;
 import org.apache.storm.generated.WorkerResources;
 import org.apache.storm.scheduler.resource.normalization.NormalizedResourceOffer;
@@ -154,6 +156,12 @@ public interface ISchedulingState {
     List<WorkerSlot> getAvailableSlots();
 
     /**
+     * Get all the available worker slots in the cluster, that are not blacklisted.
+     * @param blacklistedSupervisorIds list of supervisor ids that should also be considered blacklisted.
+     */
+    List<WorkerSlot> getNonBlacklistedAvailableSlots(List<String> blacklistedSupervisorIds);
+
+    /**
      * Return all non-blacklisted slots on this supervisor.
      *
      * @param supervisor the supervisor
@@ -186,6 +194,13 @@ public interface ISchedulingState {
      * @return the number of workers assigned to this topology.
      */
     int getAssignedNumWorkers(TopologyDetails topology);
+
+    /**
+     * Get the resources on the supervisor that are available to be scheduled.
+     * @param sd the supervisor.
+     * @return the resources available to be scheduled.
+     */
+    NormalizedResourceOffer getAvailableResources(SupervisorDetails sd);
 
     /**
      * Would scheduling exec on ws fit? With a heap <= maxHeap total memory added <= memoryAvailable and cpu added <= cpuAvailable.
@@ -239,8 +254,14 @@ public interface ISchedulingState {
 
     /**
      * Get all scheduled resources for node.
-     **/
+     */
     NormalizedResourceRequest getAllScheduledResourcesForNode(String nodeId);
+
+    /**
+     * Get the resources in the cluster that are available for scheduling.
+     * @param blacklistedSupervisorIds other ids that are tentatively blacklisted.
+     */
+    NormalizedResourceOffer getNonBlacklistedClusterAvailableResources(Collection<String> blacklistedSupervisorIds);
 
     /**
      * Get the total amount of CPU resources in cluster.
@@ -251,6 +272,11 @@ public interface ISchedulingState {
      * Get the total amount of memory resources in cluster.
      */
     double getClusterTotalMemoryResource();
+
+    /**
+     * Get the total amount of generic resources (excluding CPU and memory) in cluster.
+     */
+    Map<String, Double> getClusterTotalGenericResources();
 
     /**
      * Get the network topography (rackId -> nodes in the rack).

@@ -64,6 +64,13 @@ public class HiveState implements State {
 
     @Override
     public void commit(Long txId) {
+        try {
+            flushAllWriters();
+            currentBatchSize = 0;
+        } catch (HiveWriter.TxnFailure | InterruptedException | HiveWriter.CommitFailure | HiveWriter.TxnBatchFailure ex) {
+            LOG.warn("Commit failed. Failing the batch.", ex);
+            throw new FailedException(ex);
+        }
     }
 
     public void prepare(Map<String, Object> conf, IMetricsContext metrics, int partitionIndex, int numPartitions) {
@@ -80,7 +87,7 @@ public class HiveState implements State {
             String timeoutName = "hive-bolt-%d";
             this.callTimeoutPool = Executors.newFixedThreadPool(1,
                                                                 new ThreadFactoryBuilder().setNameFormat(timeoutName).build());
-            heartBeatTimer = new Timer();
+            heartBeatTimer = new Timer("hive-hb-timer", true);
             setupHeartBeatTimer();
         } catch (Exception e) {
             LOG.warn("unable to make connection to hive ", e);
@@ -123,7 +130,7 @@ public class HiveState implements State {
     }
 
     /**
-     * Abort current Txn on all writers
+     * Abort current Txn on all writers.
      */
     private void abortAllWriters() throws InterruptedException, StreamingException, HiveWriter.TxnBatchFailure {
         for (Entry<HiveEndPoint, HiveWriter> entry : allWriters.entrySet()) {
@@ -133,7 +140,7 @@ public class HiveState implements State {
 
 
     /**
-     * Closes all writers and remove them from cache
+     * Closes all writers and remove them from cache.
      * @return number of writers retired
      */
     private void closeAllWriters() throws InterruptedException, IOException {
@@ -202,7 +209,7 @@ public class HiveState implements State {
 
 
     /**
-     * Locate writer that has not been used for longest time and retire it
+     * Locate writer that has not been used for longest time and retire it.
      */
     private void retireEldestWriter() {
         long oldestTimeStamp = System.currentTimeMillis();
@@ -227,7 +234,7 @@ public class HiveState implements State {
     }
 
     /**
-     * Locate all writers past idle timeout and retire them
+     * Locate all writers past idle timeout and retire them.
      * @return number of writers retired
      */
     private int retireIdleWriters() {
@@ -269,15 +276,15 @@ public class HiveState implements State {
                 LOG.info("Closing writer to {}", w);
                 w.close();
             } catch (Exception ex) {
-                LOG.warn("Error while closing writer to " + entry.getKey() +
-                         ". Exception follows.", ex);
+                LOG.warn("Error while closing writer to " + entry.getKey() + ". Exception follows.",
+                        ex);
                 if (ex instanceof InterruptedException) {
                     Thread.currentThread().interrupt();
                 }
             }
         }
 
-        ExecutorService toShutdown[] = { callTimeoutPool };
+        ExecutorService[] toShutdown = { callTimeoutPool };
         for (ExecutorService execService : toShutdown) {
             execService.shutdown();
             try {
@@ -289,6 +296,7 @@ public class HiveState implements State {
                 LOG.warn("shutdown interrupted on " + execService, ex);
             }
         }
+        heartBeatTimer.cancel();
         callTimeoutPool = null;
     }
 

@@ -18,18 +18,20 @@
 package org.apache.storm.st.topology.window;
 
 import com.google.common.collect.Lists;
-import org.apache.storm.generated.StormTopology;
-import org.apache.storm.topology.TopologyBuilder;
-import org.apache.storm.topology.base.BaseWindowedBolt;
-import org.apache.storm.st.topology.TestableTopology;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.apache.storm.st.utils.StringDecorator;
 
 import java.util.List;
 
+import org.apache.storm.generated.StormTopology;
+import org.apache.storm.st.topology.TestableTopology;
+import org.apache.storm.st.utils.StringDecorator;
+import org.apache.storm.topology.TopologyBuilder;
+import org.apache.storm.topology.base.BaseWindowedBolt;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 /**
- * Computes sliding window sum
+ * Computes sliding window sum.
  */
 public class TumblingWindowCorrectness implements TestableTopology {
     private static final Logger LOG = LoggerFactory.getLogger(TumblingWindowCorrectness.class);
@@ -37,7 +39,9 @@ public class TumblingWindowCorrectness implements TestableTopology {
     private static final String STRING_FIELD = "numAsStr";
     private final int tumbleSize;
     private final String spoutName;
+    private final int spoutExecutors = 1;
     private final String boltName;
+    private final int boltExecutors = 1;
 
     public TumblingWindowCorrectness(final int tumbleSize) {
         this.tumbleSize = tumbleSize;
@@ -55,14 +59,24 @@ public class TumblingWindowCorrectness implements TestableTopology {
     public String getSpoutName() {
         return spoutName;
     }
+    
+    @Override
+    public int getBoltExecutors() {
+        return boltExecutors;
+    }
+
+    @Override
+    public int getSpoutExecutors() {
+        return spoutExecutors;
+    }
 
     @Override
     public StormTopology newTopology() {
         TopologyBuilder builder = new TopologyBuilder();
-        builder.setSpout(getSpoutName(), new IncrementingSpout(), 1);
+        builder.setSpout(getSpoutName(), new IncrementingSpout(), spoutExecutors);
         builder.setBolt(getBoltName(),
                 new VerificationBolt()
-                        .withTumblingWindow(new BaseWindowedBolt.Count(tumbleSize)), 1)
+                        .withTumblingWindow(new BaseWindowedBolt.Count(tumbleSize)), boltExecutors)
                 .shuffleGrouping(getSpoutName());
         return builder.createTopology();
     }

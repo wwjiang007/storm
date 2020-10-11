@@ -13,22 +13,21 @@ package org.apache.storm.metricstore.rocksdb;
 
 import java.util.Map;
 import java.util.Set;
-import org.apache.http.annotation.NotThreadSafe;
 import org.apache.storm.metricstore.MetricException;
 
 /**
  * The writable interface to a StringMetadataCache intended to be used by a single RocksDBMetricwWriter instance.
+ * This class is not thread safe.
  */
-@NotThreadSafe
 public interface WritableStringMetadataCache extends ReadOnlyStringMetadataCache {
 
     /**
      * Add the string metadata to the cache.
      *
-     * * NOTE: this can cause data to be evicted from the cache when full.  When this occurs, the evictionCallback() method
+     * <p>NOTE: this can cause data to be evicted from the cache when full.  When this occurs, the evictionCallback() method
      * is called to store the metadata back into the RocksDB database.
      *
-     * This method is only exposed to the WritableStringMetadataCache interface.
+     * <p>This method is only exposed to the WritableStringMetadataCache interface.
      *
      * @param s   The string to add
      * @param stringMetadata  The string's metadata

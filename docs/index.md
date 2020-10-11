@@ -65,7 +65,8 @@ But small change will not affect the user experience. We will notify the user wh
 * [CGroup Enforcement](cgroups_in_storm.html)
 * [Pacemaker reduces load on zookeeper for large clusters](Pacemaker.html)
 * [Resource Aware Scheduler](Resource_Aware_Scheduler_overview.html)
-* [Daemon Metrics/Monitoring](storm-metrics-profiling-internal-actions.html)
+* [Generic Resources](Generic-resources.html)
+* [Daemon Metrics/Monitoring](ClusterMetrics.html)
 * [Windows users guide](windows-users-guide.html)
 * [Classpath handling](Classpath-handling.html)
 
@@ -82,7 +83,7 @@ But small change will not affect the user experience. We will notify the user wh
 * [State Checkpointing](State-checkpointing.html)
 * [Windowing](Windowing.html)
 * [Joining Streams](Joins.html)
-* [Blobstore(Distcahce)](distcache-blobstore.html)
+* [Blobstore(Distcache)](distcache-blobstore.html)
 
 ### Debugging
 * [Dynamic Log Level Settings](dynamic-log-level-settings.html)

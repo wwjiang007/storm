@@ -24,6 +24,7 @@ import static javax.ws.rs.core.Response.Status.FORBIDDEN;
 import static javax.ws.rs.core.Response.Status.OK;
 import static org.apache.commons.lang.StringEscapeUtils.escapeHtml;
 
+import com.codahale.metrics.Meter;
 import com.google.common.io.ByteStreams;
 
 import java.io.BufferedOutputStream;
@@ -32,6 +33,7 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.file.Files;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -73,19 +75,21 @@ public class LogviewerResponseBuilder {
     /**
      * Build a Response object representing download a file.
      *
+     * @param contentDispositionName The name to set in the Content-Disposition header
      * @param file file to download
      */
-    public static Response buildDownloadFile(File file) throws IOException {
+    public static Response buildDownloadFile(String contentDispositionName,
+        File file, Meter numFileDownloadExceptions) throws IOException {
         try {
             // do not close this InputStream in method: it will be used from jetty server
-            InputStream is = new FileInputStream(file);
+            InputStream is = Files.newInputStream(file.toPath());
             return Response.status(OK)
                     .entity(wrapWithStreamingOutput(is))
                     .type(MediaType.APPLICATION_OCTET_STREAM_TYPE)
-                    .header("Content-Disposition", "attachment; filename=\"" + file.getName() + "\"")
+                    .header("Content-Disposition", "attachment; filename=\"" + contentDispositionName + "\"")
                     .build();
         } catch (IOException e) {
-            ExceptionMeters.NUM_FILE_DOWNLOAD_EXCEPTIONS.mark();
+            numFileDownloadExceptions.mark();
             throw e;
         }
     }

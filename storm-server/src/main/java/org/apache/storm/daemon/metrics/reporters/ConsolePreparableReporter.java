@@ -17,31 +17,31 @@ import com.codahale.metrics.MetricRegistry;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
-import org.apache.storm.daemon.metrics.ClientMetricsUtils;
+import org.apache.storm.daemon.metrics.MetricsUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public class ConsolePreparableReporter implements PreparableReporter<ConsoleReporter> {
+public class ConsolePreparableReporter implements PreparableReporter {
     private static final Logger LOG = LoggerFactory.getLogger(ConsolePreparableReporter.class);
     ConsoleReporter reporter = null;
 
     @Override
-    public void prepare(MetricRegistry metricsRegistry, Map<String, Object> topoConf) {
+    public void prepare(MetricRegistry metricsRegistry, Map<String, Object> daemonConf) {
         LOG.debug("Preparing...");
         ConsoleReporter.Builder builder = ConsoleReporter.forRegistry(metricsRegistry);
 
         builder.outputTo(System.out);
-        Locale locale = ClientMetricsUtils.getMetricsReporterLocale(topoConf);
+        Locale locale = MetricsUtils.getMetricsReporterLocale(daemonConf);
         if (locale != null) {
             builder.formattedFor(locale);
         }
 
-        TimeUnit rateUnit = ClientMetricsUtils.getMetricsRateUnit(topoConf);
+        TimeUnit rateUnit = MetricsUtils.getMetricsRateUnit(daemonConf);
         if (rateUnit != null) {
             builder.convertRatesTo(rateUnit);
         }
 
-        TimeUnit durationUnit = ClientMetricsUtils.getMetricsDurationUnit(topoConf);
+        TimeUnit durationUnit = MetricsUtils.getMetricsDurationUnit(daemonConf);
         if (durationUnit != null) {
             builder.convertDurationsTo(durationUnit);
         }
@@ -62,6 +62,7 @@ public class ConsolePreparableReporter implements PreparableReporter<ConsoleRepo
     public void stop() {
         if (reporter != null) {
             LOG.debug("Stopping...");
+            reporter.report();
             reporter.stop();
         } else {
             throw new IllegalStateException("Attempt to stop without preparing " + getClass().getSimpleName());

@@ -90,8 +90,6 @@ public class KafkaSpoutMessagingGuaranteeTest {
 
         spout.nextTuple();
 
-        when(consumerMock.position(partition)).thenReturn(1L);
-
         //The spout should have emitted the tuple, and must have committed it before emit
         InOrder inOrder = inOrder(consumerMock, collectorMock);
         inOrder.verify(consumerMock).poll(anyLong());
@@ -155,9 +153,6 @@ public class KafkaSpoutMessagingGuaranteeTest {
 
         reset(consumerMock);
 
-        when(consumerMock.poll(anyLong())).thenReturn(new ConsumerRecords<>(Collections.singletonMap(partition,
-            SpoutWithMockedConsumerSetupHelper.createRecords(partition, 1, 1))));
-
         spout.nextTuple();
 
         //The consumer should not be seeking to retry the failed tuple, it should just be continuing from the current position
@@ -212,7 +207,7 @@ public class KafkaSpoutMessagingGuaranteeTest {
 
             spout.nextTuple();
 
-            verify(consumerMock, never()).commitSync(argThat(arg -> {
+            verify(consumerMock, never()).commitSync(argThat((Map<TopicPartition, OffsetAndMetadata> arg) -> {
                 return !arg.containsKey(partition);
             }));
         }

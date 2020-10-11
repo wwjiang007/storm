@@ -20,23 +20,17 @@ package org.apache.storm.zookeeper;
 
 import java.io.File;
 import java.net.BindException;
-import java.net.InetAddress;
 import java.net.InetSocketAddress;
-import java.net.UnknownHostException;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicReference;
 import org.apache.commons.lang.StringUtils;
-import org.apache.storm.Config;
 import org.apache.storm.blobstore.BlobStore;
 import org.apache.storm.cluster.IStormClusterState;
 import org.apache.storm.daemon.nimbus.TopoCache;
+import org.apache.storm.metric.StormMetricsRegistry;
 import org.apache.storm.nimbus.ILeaderElector;
-import org.apache.storm.nimbus.LeaderListenerCallback;
 import org.apache.storm.nimbus.NimbusInfo;
 import org.apache.storm.shade.org.apache.curator.framework.CuratorFramework;
-import org.apache.storm.shade.org.apache.curator.framework.recipes.leader.LeaderLatch;
-import org.apache.storm.shade.org.apache.curator.framework.recipes.leader.LeaderLatchListener;
 import org.apache.storm.shade.org.apache.curator.framework.recipes.leader.Participant;
 import org.apache.storm.shade.org.apache.zookeeper.data.ACL;
 import org.apache.storm.shade.org.apache.zookeeper.server.NIOServerCnxnFactory;
@@ -50,7 +44,7 @@ public class Zookeeper {
     // tests by subclassing.
     private static final Zookeeper INSTANCE = new Zookeeper();
     private static Logger LOG = LoggerFactory.getLogger(Zookeeper.class);
-    private static Zookeeper _instance = INSTANCE;
+    private static Zookeeper instance = INSTANCE;
 
     /**
      * Provide an instance of this class for delegates to use.  To mock out delegated methods, provide an instance of a subclass that
@@ -59,7 +53,7 @@ public class Zookeeper {
      * @param u a Zookeeper instance
      */
     public static void setInstance(Zookeeper u) {
-        _instance = u;
+        instance = u;
     }
 
     /**
@@ -67,12 +61,10 @@ public class Zookeeper {
      * longer desired.
      */
     public static void resetInstance() {
-        _instance = INSTANCE;
+        instance = INSTANCE;
     }
 
     public static NIOServerCnxnFactory mkInprocessZookeeper(String localdir, Integer port) throws Exception {
-        File localfile = new File(localdir);
-        ZooKeeperServer zk = new ZooKeeperServer(localfile, localfile, 2000);
         NIOServerCnxnFactory factory = null;
         int report = 2000;
         int limitPort = 65535;
@@ -93,6 +85,8 @@ public class Zookeeper {
             }
         }
         LOG.info("Starting inprocess zookeeper at port {} and dir {}", report, localdir);
+        File localfile = new File(localdir);
+        ZooKeeperServer zk = new ZooKeeperServer(localfile, localfile, 2000);
         factory.startup(zk);
         return factory;
     }
@@ -111,27 +105,6 @@ public class Zookeeper {
         return nimbusInfo;
     }
 
-    // Leader latch listener that will be invoked when we either gain or lose leadership
-    public static LeaderLatchListener leaderLatchListenerImpl(final LeaderListenerCallback callback)
-        throws UnknownHostException {
-        final String hostName = InetAddress.getLocalHost().getCanonicalHostName();
-        return new LeaderLatchListener() {
-
-            @Override
-            public void isLeader() {
-                callback.leaderCallBack();
-                LOG.info("{} gained leadership.", hostName);
-            }
-
-            @Override
-            public void notLeader() {
-                LOG.info("{} lost leadership.", hostName);
-                //Just to be sure
-                callback.notLeaderCallback();
-            }
-        };
-    }
-
     /**
      * Get master leader elector.
      *
@@ -142,27 +115,19 @@ public class Zookeeper {
      * @param clusterState {@link IStormClusterState}
      * @param acls         ACLs
      * @return Instance of {@link ILeaderElector}
-     *
-     * @throws UnknownHostException
      */
     public static ILeaderElector zkLeaderElector(Map<String, Object> conf, CuratorFramework zkClient, BlobStore blobStore,
-                                                 final TopoCache tc, IStormClusterState clusterState, List<ACL> acls) throws
-        UnknownHostException {
-        return _instance.zkLeaderElectorImpl(conf, zkClient, blobStore, tc, clusterState, acls);
+                                                 final TopoCache tc, IStormClusterState clusterState, List<ACL> acls,
+                                                 StormMetricsRegistry metricsRegistry) {
+        return instance.zkLeaderElectorImpl(conf, zkClient, blobStore, tc, clusterState, acls, metricsRegistry);
     }
 
     protected ILeaderElector zkLeaderElectorImpl(Map<String, Object> conf, CuratorFramework zk, BlobStore blobStore,
-                                                 final TopoCache tc, IStormClusterState clusterState, List<ACL> acls) throws
-        UnknownHostException {
-        List<String> servers = (List<String>) conf.get(Config.STORM_ZOOKEEPER_SERVERS);
-        String leaderLockPath = "/leader-lock";
+                                                 final TopoCache tc, IStormClusterState clusterState, List<ACL> acls,
+                                                 StormMetricsRegistry metricsRegistry) {
         String id = NimbusInfo.fromConf(conf).toHostPortString();
-        AtomicReference<LeaderLatch> leaderLatchAtomicReference = new AtomicReference<>(new LeaderLatch(zk, leaderLockPath, id));
-        AtomicReference<LeaderLatchListener> leaderLatchListenerAtomicReference =
-            new AtomicReference<>(leaderLatchListenerImpl(
-                new LeaderListenerCallback(conf, zk, leaderLatchAtomicReference.get(), blobStore, tc, clusterState, acls)));
-        return new LeaderElectorImp(conf, servers, zk, leaderLockPath, id, leaderLatchAtomicReference,
-                                    leaderLatchListenerAtomicReference, blobStore, tc, clusterState, acls);
+        return new LeaderElectorImp(zk, id,
+            new LeaderListenerCallbackFactory(conf, zk, blobStore, tc, clusterState, acls, metricsRegistry));
     }
 
 }

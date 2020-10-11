@@ -55,12 +55,20 @@
             Requested CPU
           </span>
         </th>
+        <th>
+          <span data-toggle="tooltip" data-placement="above" title="The generic resources requested to run a single executor of this component.">
+            Requested Generic Resources
+          </span>
+        </th>
+
         {{/schedulerDisplayResource}}
+        {{#eventLogLink}}
         <th>
           <span data-toggle="tooltip" data-placement="top" title="Click on the link below to open the logviewer and view the events emitted by this component.">
             Debug
           </span>
         </th>
+        {{/eventLogLink}}
       </tr>
     </thead>
     <tbody>
@@ -73,8 +81,11 @@
         <td>{{requestedMemOnHeap}}</td>
         <td>{{requestedMemOffHeap}}</td>
         <td>{{requestedCpu}}</td>
+        <td>{{requestedGenericResources}}</td>
         {{/schedulerDisplayResource}}
+        {{#eventLogLink}}
         <td><a href="{{eventLogLink}}">events</a></td>
+        {{/eventLogLink}}
     </tbody>
   </table>
 </script>

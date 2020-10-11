@@ -18,36 +18,35 @@ import java.io.File;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
-import org.apache.storm.daemon.metrics.ClientMetricsUtils;
 import org.apache.storm.daemon.metrics.MetricsUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public class CsvPreparableReporter implements PreparableReporter<CsvReporter> {
+public class CsvPreparableReporter implements PreparableReporter {
     private static final Logger LOG = LoggerFactory.getLogger(CsvPreparableReporter.class);
     CsvReporter reporter = null;
 
     @Override
-    public void prepare(MetricRegistry metricsRegistry, Map<String, Object> topoConf) {
+    public void prepare(MetricRegistry metricsRegistry, Map<String, Object> daemonConf) {
         LOG.debug("Preparing...");
         CsvReporter.Builder builder = CsvReporter.forRegistry(metricsRegistry);
 
-        Locale locale = ClientMetricsUtils.getMetricsReporterLocale(topoConf);
+        Locale locale = MetricsUtils.getMetricsReporterLocale(daemonConf);
         if (locale != null) {
             builder.formatFor(locale);
         }
 
-        TimeUnit rateUnit = ClientMetricsUtils.getMetricsRateUnit(topoConf);
+        TimeUnit rateUnit = MetricsUtils.getMetricsRateUnit(daemonConf);
         if (rateUnit != null) {
             builder.convertRatesTo(rateUnit);
         }
 
-        TimeUnit durationUnit = ClientMetricsUtils.getMetricsDurationUnit(topoConf);
+        TimeUnit durationUnit = MetricsUtils.getMetricsDurationUnit(daemonConf);
         if (durationUnit != null) {
             builder.convertDurationsTo(durationUnit);
         }
 
-        File csvMetricsDir = MetricsUtils.getCsvLogDir(topoConf);
+        File csvMetricsDir = MetricsUtils.getCsvLogDir(daemonConf);
         reporter = builder.build(csvMetricsDir);
     }
 
@@ -65,6 +64,7 @@ public class CsvPreparableReporter implements PreparableReporter<CsvReporter> {
     public void stop() {
         if (reporter != null) {
             LOG.debug("Stopping...");
+            reporter.report();
             reporter.stop();
         } else {
             throw new IllegalStateException("Attempt to stop without preparing " + getClass().getSimpleName());

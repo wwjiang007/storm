@@ -23,15 +23,20 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import java.io.PrintWriter;
 import java.io.StringWriter;
-import java.net.URLEncoder;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.NavigableMap;
+import java.util.Objects;
 import java.util.Set;
+import java.util.TreeMap;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -39,16 +44,19 @@ import javax.servlet.DispatcherType;
 import javax.servlet.Servlet;
 import javax.ws.rs.core.Response;
 import javax.ws.rs.core.SecurityContext;
-
 import org.apache.storm.Config;
 import org.apache.storm.Constants;
 import org.apache.storm.DaemonConfig;
+import org.apache.storm.daemon.common.ReloadableSslContextFactory;
 import org.apache.storm.generated.Bolt;
 import org.apache.storm.generated.BoltAggregateStats;
 import org.apache.storm.generated.ClusterSummary;
 import org.apache.storm.generated.CommonAggregateStats;
 import org.apache.storm.generated.ComponentAggregateStats;
 import org.apache.storm.generated.ComponentPageInfo;
+import org.apache.storm.generated.ComponentType;
+import org.apache.storm.generated.ErrorInfo;
+import org.apache.storm.generated.ExecutorAggregateStats;
 import org.apache.storm.generated.ExecutorInfo;
 import org.apache.storm.generated.ExecutorSummary;
 import org.apache.storm.generated.GetInfoOptions;
@@ -66,6 +74,8 @@ import org.apache.storm.generated.OwnerResourceSummary;
 import org.apache.storm.generated.ProfileAction;
 import org.apache.storm.generated.ProfileRequest;
 import org.apache.storm.generated.RebalanceOptions;
+import org.apache.storm.generated.SpecificAggregateStats;
+import org.apache.storm.generated.SpoutAggregateStats;
 import org.apache.storm.generated.SpoutSpec;
 import org.apache.storm.generated.StormTopology;
 import org.apache.storm.generated.SupervisorPageInfo;
@@ -77,9 +87,12 @@ import org.apache.storm.generated.TopologyStats;
 import org.apache.storm.generated.TopologySummary;
 import org.apache.storm.generated.WorkerSummary;
 import org.apache.storm.logging.filters.AccessLoggingFilter;
+import org.apache.storm.scheduler.resource.normalization.NormalizedResourceRequest;
 import org.apache.storm.stats.StatsUtil;
 import org.apache.storm.thrift.TException;
+import org.apache.storm.utils.IVersionInfo;
 import org.apache.storm.utils.ObjectReader;
+import org.apache.storm.utils.Time;
 import org.apache.storm.utils.TopologySpoutLag;
 import org.apache.storm.utils.Utils;
 import org.apache.storm.utils.VersionInfo;
@@ -98,9 +111,12 @@ import org.eclipse.jetty.servlet.ServletHolder;
 import org.eclipse.jetty.servlets.CrossOriginFilter;
 import org.eclipse.jetty.util.ssl.SslContextFactory;
 import org.json.simple.JSONValue;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
+@SuppressWarnings("checkstyle:AbbreviationAsWordInName")
 public class UIHelpers {
-
+    private static final Logger LOG = LoggerFactory.getLogger(UIHelpers.class);
     private static final Object[][] PRETTY_SEC_DIVIDERS = {
         new Object[]{ "s", 60 },
         new Object[]{ "m", 60 },
@@ -185,7 +201,7 @@ public class UIHelpers {
     public static String urlFormat(String fmt, Object... args) {
         String[] argsEncoded = new String[args.length];
         for (int i = 0; i < args.length; i++) {
-            argsEncoded[i] = URLEncoder.encode(String.valueOf(args[i]));
+            argsEncoded[i] = Utils.urlEncodeUtf8(String.valueOf(args[i]));
         }
         return String.format(fmt, argsEncoded);
     }
@@ -215,8 +231,8 @@ public class UIHelpers {
                                                   String keyPassword, String tsPath,
                                                   String tsPassword, String tsType,
                                                   Boolean needClientAuth, Boolean wantClientAuth,
-                                                  Integer headerBufferSize) {
-        SslContextFactory factory = new SslContextFactory();
+                                                  Integer headerBufferSize, boolean enableSslReload) {
+        SslContextFactory factory = new ReloadableSslContextFactory(enableSslReload);
         factory.setExcludeCipherSuites("SSL_RSA_WITH_RC4_128_MD5", "SSL_RSA_WITH_RC4_128_SHA");
         factory.setExcludeProtocols("SSLv3");
         factory.setRenegotiationAllowed(false);
@@ -255,9 +271,9 @@ public class UIHelpers {
                                  String ksPassword, String ksType,
                                  String keyPassword, String tsPath,
                                  String tsPassword, String tsType,
-                                 Boolean needClientAuth, Boolean wantClientAuth) {
+                                 Boolean needClientAuth, Boolean wantClientAuth, boolean enableSslReload) {
         configSsl(server, port, ksPath, ksPassword, ksType, keyPassword,
-                  tsPath, tsPassword, tsType, needClientAuth, wantClientAuth, null);
+                  tsPath, tsPassword, tsType, needClientAuth, wantClientAuth, null, enableSslReload);
     }
 
     /**
@@ -274,19 +290,21 @@ public class UIHelpers {
      * @param needClientAuth needClientAuth
      * @param wantClientAuth wantClientAuth
      * @param headerBufferSize headerBufferSize
+     * @param enableSslReload enable ssl reload
      */
     public static void configSsl(Server server, Integer port, String ksPath,
                                  String ksPassword, String ksType,
                                  String keyPassword, String tsPath,
                                  String tsPassword, String tsType,
                                  Boolean needClientAuth,
-                                 Boolean wantClientAuth, Integer headerBufferSize) {
+                                 Boolean wantClientAuth, Integer headerBufferSize,
+                                 boolean enableSslReload) {
         if (port > 0) {
             server.addConnector(
                     mkSslConnector(
                             server, port, ksPath, ksPassword, ksType, keyPassword,
                             tsPath, tsPassword, tsType,
-                            needClientAuth, wantClientAuth, headerBufferSize
+                            needClientAuth, wantClientAuth, headerBufferSize, enableSslReload
                     )
             );
         }
@@ -379,18 +397,18 @@ public class UIHelpers {
     /**
      * Construct a Jetty Server instance.
      */
-    public static Server jettyCreateServer(Integer port, String host, Integer httpsPort) {
-        return jettyCreateServer(port, host, httpsPort, null);
+    public static Server jettyCreateServer(Integer port, String host, Integer httpsPort, Boolean disableHttpBinding) {
+        return jettyCreateServer(port, host, httpsPort, null, disableHttpBinding);
     }
 
     /**
      * Construct a Jetty Server instance.
      */
     public static Server jettyCreateServer(Integer port, String host,
-                                           Integer httpsPort, Integer headerBufferSize) {
+                                           Integer httpsPort, Integer headerBufferSize, Boolean disableHttpBinding) {
         Server server = new Server();
 
-        if (httpsPort == null || httpsPort <= 0) {
+        if (httpsPort == null || httpsPort <= 0 || disableHttpBinding == null || disableHttpBinding == false) {
             HttpConfiguration httpConfig = new HttpConfiguration();
             httpConfig.setSendDateHeader(true);
             if (null != headerBufferSize) {
@@ -415,7 +433,7 @@ public class UIHelpers {
     public static void stormRunJetty(Integer port, String host,
                                      Integer httpsPort, Integer headerBufferSize,
                                      IConfigurator configurator) throws Exception {
-        Server s = jettyCreateServer(port, host, httpsPort, headerBufferSize);
+        Server s = jettyCreateServer(port, host, httpsPort, headerBufferSize, false);
         if (configurator != null) {
             configurator.execute(s);
         }
@@ -510,6 +528,21 @@ public class UIHelpers {
         return responseBuilder.build();
     }
 
+    private static final AtomicReference<List<Map<String, String>>> MEMORIZED_VERSIONS = new AtomicReference<>();
+    private static final AtomicReference<Map<String, String>> MEMORIZED_FULL_VERSION = new AtomicReference<>();
+
+    private static Map<String, String> toJsonStruct(IVersionInfo info) {
+        Map<String, String> ret = new HashMap<>();
+        ret.put("version", info.getVersion());
+        ret.put("revision", info.getRevision());
+        ret.put("branch", info.getBranch());
+        ret.put("date", info.getDate());
+        ret.put("user", info.getUser());
+        ret.put("url", info.getUrl());
+        ret.put("srcChecksum", info.getSrcChecksum());
+        return ret;
+    }
+
     /**
      * Converts thrift call result into map fit for UI/api.
      * @param clusterSummary Obtained from Nimbus.
@@ -520,22 +553,56 @@ public class UIHelpers {
     public static Map<String, Object> getClusterSummary(ClusterSummary clusterSummary, String user,
                                                         Map<String, Object> conf) {
         Map<String, Object> result = new HashMap();
+
+        if (MEMORIZED_VERSIONS.get() == null) {
+            //Races are okay this is just to avoid extra work for each page load.
+            NavigableMap<String, IVersionInfo> versionsMap = Utils.getAlternativeVersionsMap(conf);
+            List<Map<String, String>> versionList = new ArrayList<>();
+            for (Map.Entry<String, IVersionInfo> entry : versionsMap.entrySet()) {
+                Map<String, String> single = new HashMap<>(toJsonStruct(entry.getValue()));
+                single.put("versionMatch", entry.getKey());
+                versionList.add(single);
+            }
+            MEMORIZED_VERSIONS.set(versionList);
+        }
+        List<Map<String, String>> versions = MEMORIZED_VERSIONS.get();
+        if (!versions.isEmpty()) {
+            result.put("alternativeWorkerVersions", versions);
+        }
+
+        if (MEMORIZED_FULL_VERSION.get() == null) {
+            MEMORIZED_FULL_VERSION.set(toJsonStruct(VersionInfo.OUR_FULL_VERSION));
+        }
+
+        result.put("user", user);
+        result.put("stormVersion", VersionInfo.getVersion());
+        result.put("stormVersionInfo", MEMORIZED_FULL_VERSION.get());
         List<SupervisorSummary> supervisorSummaries = clusterSummary.get_supervisors();
-        List<TopologySummary> topologySummaries = clusterSummary.get_topologies();
+        result.put("supervisors", supervisorSummaries.size());
+        result.put("topologies", clusterSummary.get_topologies_size());
 
         int usedSlots =
                 supervisorSummaries.stream().mapToInt(
-                SupervisorSummary::get_num_used_workers).sum();
+                        SupervisorSummary::get_num_used_workers).sum();
+        result.put("slotsUsed", usedSlots);
+
         int totalSlots =
                 supervisorSummaries.stream().mapToInt(
                         SupervisorSummary::get_num_workers).sum();
+        result.put("slotsTotal", totalSlots);
+        result.put("slotsFree", totalSlots - usedSlots);
 
+        List<TopologySummary> topologySummaries = clusterSummary.get_topologies();
         int totalTasks =
                 topologySummaries.stream().mapToInt(
                         TopologySummary::get_num_tasks).sum();
+        result.put("tasksTotal", totalTasks);
+
         int totalExecutors =
                 topologySummaries.stream().mapToInt(
                         TopologySummary::get_num_executors).sum();
+        result.put("executorsTotal", totalExecutors);
+
 
         double supervisorTotalMemory =
                 supervisorSummaries.stream().mapToDouble(x -> x.get_total_resources().getOrDefault(
@@ -543,6 +610,7 @@ public class UIHelpers {
                         x.get_total_resources().get(Config.SUPERVISOR_MEMORY_CAPACITY_MB)
                         )
                 ).sum();
+        result.put("totalMem", supervisorTotalMemory);
 
         double supervisorTotalCpu =
                 supervisorSummaries.stream().mapToDouble(x -> x.get_total_resources().getOrDefault(
@@ -550,46 +618,49 @@ public class UIHelpers {
                         x.get_total_resources().get(Config.SUPERVISOR_CPU_CAPACITY)
                         )
                 ).sum();
+        result.put("totalCpu", supervisorTotalCpu);
 
         double supervisorUsedMemory =
-                supervisorSummaries.stream().mapToDouble(SupervisorSummary::get_used_mem).sum();
-        double supervisorUsedCpu =
-                supervisorSummaries.stream().mapToDouble(SupervisorSummary::get_used_cpu).sum();
-        double supervisorFragementedCpu =
-                supervisorSummaries.stream().mapToDouble(
-                        SupervisorSummary::get_fragmented_cpu).sum();
-        double supervisorFragmentedMem =
-                supervisorSummaries.stream().mapToDouble(
-                        SupervisorSummary::get_fragmented_mem).sum();
-
-
-        result.put("user", user);
-        result.put("stormVersion", VersionInfo.getVersion());
-        result.put("supervisors", supervisorSummaries.size());
-        result.put("topologies", clusterSummary.get_topologies_size());
-        result.put("slotsUsed", usedSlots);
-        result.put("slotsTotal", totalSlots);
-        result.put("slotsFree", totalSlots - usedSlots);
-        result.put("tasksTotal", totalTasks);
-        result.put("executorsTotal", totalExecutors);
-
-        result.put("totalMem", supervisorTotalMemory);
-        result.put("totalCpu", supervisorTotalCpu);
+            supervisorSummaries.stream().mapToDouble(SupervisorSummary::get_used_mem).sum();
         result.put("availMem", supervisorTotalMemory - supervisorUsedMemory);
+
+        double supervisorUsedCpu =
+            supervisorSummaries.stream().mapToDouble(SupervisorSummary::get_used_cpu).sum();
         result.put("availCpu", supervisorTotalCpu - supervisorUsedCpu);
-        result.put("fragmentedMem", supervisorFragmentedMem);
-        result.put("fragmentedCpu", supervisorFragementedCpu);
+        result.put("fragmentedMem", supervisorSummaries.stream().mapToDouble(SupervisorSummary::get_fragmented_mem).sum());
+        result.put("fragmentedCpu", supervisorSummaries.stream().mapToDouble(SupervisorSummary::get_fragmented_cpu).sum());
         result.put("schedulerDisplayResource",
                 conf.get(DaemonConfig.SCHEDULER_DISPLAY_RESOURCE));
         result.put("memAssignedPercentUtil", supervisorTotalMemory > 0
-                ? String.valueOf((supervisorTotalMemory - supervisorUsedMemory)  * 100.0
-                / supervisorTotalMemory) : "0.0");
+                ? StatsUtil.floatStr((supervisorUsedMemory  * 100.0) / supervisorTotalMemory) : "0.0");
         result.put("cpuAssignedPercentUtil", supervisorTotalCpu > 0
-                ? String.valueOf((supervisorTotalCpu - supervisorUsedCpu) * 100.0
-                / supervisorTotalCpu) : "0.0");
+                ? StatsUtil.floatStr((supervisorUsedCpu * 100.0) / supervisorTotalCpu) : "0.0");
         result.put("bugtracker-url", conf.get(DaemonConfig.UI_PROJECT_BUGTRACKER_URL));
         result.put("central-log-url", conf.get(DaemonConfig.UI_CENTRAL_LOGGING_URL));
+
+        Map<String, Double> usedGenericResources = new HashMap<>();
+        Map<String, Double> totalGenericResources = new HashMap<>();
+        for (SupervisorSummary ss : supervisorSummaries) {
+            usedGenericResources = NormalizedResourceRequest.addResourceMap(usedGenericResources, ss.get_used_generic_resources());
+            totalGenericResources = NormalizedResourceRequest.addResourceMap(totalGenericResources, ss.get_total_resources());
+        }
+        Map<String, Double> availGenericResources = NormalizedResourceRequest
+                .subtractResourceMap(totalGenericResources, usedGenericResources);
+        result.put("availGenerics", prettifyGenericResources(availGenericResources));
+        result.put("totalGenerics", prettifyGenericResources(totalGenericResources));
         return result;
+    }
+
+    private static String prettifyGenericResources(Map<String, Double> resourceMap) {
+        if (resourceMap == null) {
+            return null;
+        }
+        TreeMap<String, Double> treeGenericResources = new TreeMap<>(); // use TreeMap for deterministic ordering
+        treeGenericResources.putAll(resourceMap);
+        NormalizedResourceRequest.removeNonGenericResources(treeGenericResources);
+        return treeGenericResources.toString()
+                .replaceAll("[{}]", "")
+                .replace(",", "");
     }
 
     /**
@@ -685,7 +756,7 @@ public class UIHelpers {
     public static Map<String, Object> getTopologyMap(TopologySummary topologySummary) {
         Map<String, Object> result = new HashMap();
         result.put("id", topologySummary.get_id());
-        result.put("encodedId", URLEncoder.encode(topologySummary.get_id()));
+        result.put("encodedId", Utils.urlEncodeUtf8(topologySummary.get_id()));
         result.put("owner", topologySummary.get_owner());
         result.put("name", topologySummary.get_name());
         result.put("status", topologySummary.get_status());
@@ -702,12 +773,14 @@ public class UIHelpers {
                 topologySummary.get_requested_memoffheap()
                         + topologySummary.get_assigned_memonheap());
         result.put("requestedCpu", topologySummary.get_requested_cpu());
+        result.put("requestedGenericResources", prettifyGenericResources(topologySummary.get_requested_generic_resources()));
         result.put("assignedMemOnHeap", topologySummary.get_assigned_memonheap());
         result.put("assignedMemOffHeap", topologySummary.get_assigned_memoffheap());
         result.put("assignedTotalMem",
                 topologySummary.get_assigned_memoffheap()
                         + topologySummary.get_assigned_memonheap());
         result.put("assignedCpu", topologySummary.get_assigned_cpu());
+        result.put("assignedGenericResources", prettifyGenericResources(topologySummary.get_assigned_generic_resources()));
         result.put("topologyVersion", topologySummary.get_topology_version());
         result.put("stormVersion", topologySummary.get_storm_version());
         return result;
@@ -731,8 +804,7 @@ public class UIHelpers {
             return unpackOwnerResourceSummary(new OwnerResourceSummary(id));
         }
 
-        List<TopologySummary> topologies = null;
-        topologies = client.getClusterInfo().get_topologies();
+        List<TopologySummary> topologies = client.getTopologySummaries();
         List<Map> topologySummaries = getTopologiesMap(id, topologies);
 
         result.putAll(unpackOwnerResourceSummary(ownerResourceSummaries.get(0)));
@@ -836,6 +908,7 @@ public class UIHelpers {
         result.put("id", supervisorSummary.get_supervisor_id());
         result.put("host", supervisorSummary.get_host());
         result.put("uptime", UIHelpers.prettyUptimeSec(supervisorSummary.get_uptime_secs()));
+        result.put("blacklisted", supervisorSummary.is_blacklisted());
         result.put("uptimeSeconds", supervisorSummary.get_uptime_secs());
         result.put("slotsTotal", supervisorSummary.get_num_workers());
         result.put("slotsUsed", supervisorSummary.get_num_used_workers());
@@ -865,6 +938,15 @@ public class UIHelpers {
         result.put("availMem", totalMemory - supervisorSummary.get_used_mem());
         result.put("availCpu", totalCpu - supervisorSummary.get_used_cpu());
         result.put("version", supervisorSummary.get_version());
+
+        Map<String, Double> totalGenericResources = new HashMap<>(totalResources);
+        result.put("totalGenericResources", prettifyGenericResources(totalGenericResources));
+        Map<String, Double> usedGenericResources = supervisorSummary.get_used_generic_resources();
+        result.put("usedGenericResources", prettifyGenericResources(usedGenericResources));
+        Map<String, Double> availGenericResources = NormalizedResourceRequest
+                .subtractResourceMap(totalGenericResources, usedGenericResources);
+        result.put("availGenericResources", prettifyGenericResources(availGenericResources));
+
         return result;
     }
 
@@ -945,6 +1027,7 @@ public class UIHelpers {
         result.put("uptimeSeconds", workerSummary.get_uptime_secs());
         result.put("workerLogLink", getWorkerLogLink(workerSummary.get_host(),
                 workerSummary.get_port(), config, workerSummary.get_topology_id()));
+        result.put("owner", workerSummary.get_owner());
         return result;
     }
 
@@ -975,8 +1058,9 @@ public class UIHelpers {
      * @param config config
      * @return getSupervisorsMap
      */
-    private static List<Map> getSupervisorsMap(List<SupervisorSummary> supervisors, Map<String, Object> config) {
-        List<Map> supervisorMaps = new ArrayList();
+    private static List<Map> getSupervisorsMap(List<SupervisorSummary> supervisors,
+                                               Map<String, Object> config) {
+        List<Map> supervisorMaps = new ArrayList<>();
         for (SupervisorSummary supervisorSummary : supervisors) {
             supervisorMaps.add(getPrettifiedSupervisorMap(supervisorSummary, config));
         }
@@ -1004,8 +1088,8 @@ public class UIHelpers {
      * @return getSupervisorPageInfo
      */
     public static Map<String, Object> getSupervisorPageInfo(
-            SupervisorPageInfo supervisorPageInfo, Map<String,Object> config) {
-        Map<String, Object> result = new HashMap();
+            SupervisorPageInfo supervisorPageInfo, Map<String, Object> config) {
+        Map<String, Object> result = new HashMap<>();
         result.put("workers", getWorkerSummaries(supervisorPageInfo, config));
         result.put("schedulerDisplayResource", config.get(DaemonConfig.SCHEDULER_DISPLAY_RESOURCE));
         List<Map> supervisorMaps = getSupervisorsMap(supervisorPageInfo.get_supervisor_summaries(), config);
@@ -1021,7 +1105,7 @@ public class UIHelpers {
      * @return getAllTopologiesSummary
      */
     public static Map<String, Object> getAllTopologiesSummary(
-            List<TopologySummary> topologies, Map<String,Object> config) {
+            List<TopologySummary> topologies, Map<String, Object> config) {
         Map<String, Object> result = new HashMap();
         result.put("topologies", getTopologiesMap(null, topologies));
         result.put("schedulerDisplayResource", config.get(DaemonConfig.SCHEDULER_DISPLAY_RESOURCE));
@@ -1077,10 +1161,17 @@ public class UIHelpers {
         result.put("configuration", topologyConf);
         result.put("visualizationTable", new ArrayList());
         result.put("schedulerDisplayResource", config.get(DaemonConfig.SCHEDULER_DISPLAY_RESOURCE));
+        result.put("bugtracker-url", config.get(DaemonConfig.UI_PROJECT_BUGTRACKER_URL));
+        result.put("central-log-url", config.get(DaemonConfig.UI_CENTRAL_LOGGING_URL));
         return result;
     }
 
-    private static Map<String, Long> getStatDisplayMapLong(Map<String,Long> windowToTransferred) {
+    /**
+     * getStatDisplayMapLong.
+     * @param windowToTransferred windowToTransferred
+     * @return getStatDisplayMapLong
+     */
+    private static Map<String, Long> getStatDisplayMapLong(Map<String, Long> windowToTransferred) {
         Map<String, Long> result = new HashMap();
         for (Map.Entry<String, Long> entry : windowToTransferred.entrySet()) {
             result.put(entry.getKey(), entry.getValue());
@@ -1088,6 +1179,11 @@ public class UIHelpers {
         return result;
     }
 
+    /**
+     * getCommonAggStatsMap.
+     * @param commonAggregateStats commonAggregateStats
+     * @return getCommonAggStatsMap
+     */
     private static Map<String, Object> getCommonAggStatsMap(CommonAggregateStats commonAggregateStats) {
         Map<String, Object> result = new HashMap();
         result.put("executors", commonAggregateStats.get_num_executors());
@@ -1096,44 +1192,376 @@ public class UIHelpers {
         result.put("transferred", commonAggregateStats.get_transferred());
         result.put("acked", commonAggregateStats.get_acked());
         result.put("failed", commonAggregateStats.get_failed());
-        result.put(
-                "requestedMemOnHeap",
-                commonAggregateStats.get_resources_map().get(Constants.COMMON_ONHEAP_MEMORY_RESOURCE_NAME)
-        );
-        result.put(
-                "requestedMemOffHeap",
-                commonAggregateStats.get_resources_map().get(Constants.COMMON_OFFHEAP_MEMORY_RESOURCE_NAME));
-        result.put(
-                "requestedCpu" ,
-                commonAggregateStats.get_resources_map().get(Constants.COMMON_CPU_RESOURCE_NAME));
+        if (commonAggregateStats.is_set_resources_map()) {
+            result.put(
+                    "requestedMemOnHeap",
+                    commonAggregateStats.get_resources_map().get(Constants.COMMON_ONHEAP_MEMORY_RESOURCE_NAME)
+            );
+            result.put(
+                    "requestedMemOffHeap",
+                    commonAggregateStats.get_resources_map().get(Constants.COMMON_OFFHEAP_MEMORY_RESOURCE_NAME));
+            result.put(
+                    "requestedCpu",
+                    commonAggregateStats.get_resources_map().get(Constants.COMMON_CPU_RESOURCE_NAME));
+            result.put(
+                    "requestedGenericResourcesComp",
+                    prettifyGenericResources(commonAggregateStats.get_resources_map()));
+        }
         return result;
     }
 
+    /**
+     * getTruncatedErrorString.
+     * @param errorString errorString
+     * @return getTruncatedErrorString
+     */
+    private static String getTruncatedErrorString(String errorString) {
+        return errorString.substring(0, Math.min(errorString.length(), 200));
+    }
+
+    /**
+     * getSpoutAggStatsMap.
+     * @param componentAggregateStats componentAggregateStats
+     * @param window window
+     * @return getSpoutAggStatsMap
+     */
     private static Map<String, Object> getSpoutAggStatsMap(
-            ComponentAggregateStats componentAggregateStats, String spoutId) {
+            ComponentAggregateStats componentAggregateStats, String window) {
         Map<String, Object> result = new HashMap();
-        result.putAll(getCommonAggStatsMap(componentAggregateStats.get_common_stats()));
-        result.put("spoutId", spoutId);
-        result.put("encodedSpoutId", URLEncoder.encode(spoutId));
-        result.put("completeLatency",
-                componentAggregateStats.get_specific_stats().get_spout().get_complete_latency_ms());
+        SpoutAggregateStats spoutAggregateStats = componentAggregateStats.get_specific_stats().get_spout();
+        CommonAggregateStats commonStats = componentAggregateStats.get_common_stats();
+        result.put("window", window);
+        result.put("windowPretty", getWindowHint(window));
+        result.put("emitted", commonStats.get_emitted());
+        result.put("transferred", commonStats.get_transferred());
+        result.put("acked", commonStats.get_acked());
+        result.put("failed", commonStats.get_failed());
+        result.put("completeLatency", spoutAggregateStats.get_complete_latency_ms());
+
+        ErrorInfo lastError = componentAggregateStats.get_last_error();
+        result.put("lastError", Objects.isNull(lastError) ?  "" : getTruncatedErrorString(lastError.get_error()));
         return result;
     }
 
+    /**
+     * getBoltAggStatsMap.
+     * @param componentAggregateStats componentAggregateStats
+     * @param window window
+     * @return getBoltAggStatsMap
+     */
     private static Map<String, Object> getBoltAggStatsMap(
-            ComponentAggregateStats componentAggregateStats, String boltId) {
+            ComponentAggregateStats componentAggregateStats, String window) {
         Map<String, Object> result = new HashMap();
-        result.putAll(getCommonAggStatsMap(componentAggregateStats.get_common_stats()));
+        CommonAggregateStats commonStats = componentAggregateStats.get_common_stats();
+        result.put("window", window);
+        result.put("windowPretty", getWindowHint(window));
+        result.put("emitted", commonStats.get_emitted());
+        result.put("transferred", commonStats.get_transferred());
+        result.put("acked", commonStats.get_acked());
+        result.put("failed", commonStats.get_failed());
+        BoltAggregateStats boltAggregateStats = componentAggregateStats.get_specific_stats().get_bolt();
+        result.put("executeLatency", StatsUtil.floatStr(boltAggregateStats.get_execute_latency_ms()));
+        result.put("executed", boltAggregateStats.get_executed());
+        result.put("processLatency", StatsUtil.floatStr(boltAggregateStats.get_process_latency_ms()));
+        result.put("capacity", StatsUtil.floatStr(boltAggregateStats.get_capacity()));
+        return result;
+    }
+
+    /**
+     * nullToZero.
+     * @param value value
+     * @return nullToZero
+     */
+    private static Long nullToZero(Long value) {
+        return !Objects.isNull(value) ? value : 0;
+    }
+
+    /**
+     * nullToZero.
+     * @param value value
+     * @return nullToZero
+     */
+    private static Double nullToZero(Double value) {
+        return !Objects.isNull(value) ? value : 0;
+    }
+
+    /**
+     * getBoltInputStats.
+     * @param globalStreamId globalStreamId
+     * @param componentAggregateStats componentAggregateStats
+     * @return getBoltInputStats
+     */
+    private static Map<String, Object> getBoltInputStats(GlobalStreamId globalStreamId,
+                                                         ComponentAggregateStats componentAggregateStats) {
+        Map<String, Object> result = new HashMap();
+        SpecificAggregateStats specificAggregateStats = componentAggregateStats.get_specific_stats();
+        BoltAggregateStats boltAggregateStats = specificAggregateStats.get_bolt();
+        CommonAggregateStats commonAggregateStats = componentAggregateStats.get_common_stats();
+        String componentId = globalStreamId.get_componentId();
+        result.put("component", componentId);
+        result.put("encodedComponentId", Utils.urlEncodeUtf8(componentId));
+        result.put("stream", globalStreamId.get_streamId());
+        result.put("executeLatency", StatsUtil.floatStr(boltAggregateStats.get_execute_latency_ms()));
+        result.put("processLatency", StatsUtil.floatStr(boltAggregateStats.get_process_latency_ms()));
+        result.put("executed", nullToZero(boltAggregateStats.get_executed()));
+        result.put("acked", nullToZero(commonAggregateStats.get_acked()));
+        result.put("failed", nullToZero(commonAggregateStats.get_failed()));
+        return result;
+    }
+
+    /**
+     * getBoltOutputStats.
+     * @param streamId streamId
+     * @param componentAggregateStats componentAggregateStats
+     * @return getBoltOutputStats
+     */
+    private static Map<String, Object> getBoltOutputStats(String streamId,
+                                                          ComponentAggregateStats componentAggregateStats) {
+        Map<String, Object> result = new HashMap();
+        result.put("stream", streamId);
+        CommonAggregateStats commonStats = componentAggregateStats.get_common_stats();
+        result.put("emitted", nullToZero(commonStats.get_emitted()));
+        result.put("transferred", nullToZero(commonStats.get_transferred()));
+        return result;
+    }
+
+    /**
+     * getSpoutOutputStats.
+     * @param streamId streamId
+     * @param componentAggregateStats componentAggregateStats
+     * @return getSpoutOutputStats
+     */
+    private static Map<String, Object> getSpoutOutputStats(String streamId,
+                                                           ComponentAggregateStats componentAggregateStats) {
+        SpecificAggregateStats specificAggregateStats = componentAggregateStats.get_specific_stats();
+        SpoutAggregateStats spoutAggregateStats = specificAggregateStats.get_spout();
+        Map<String, Object> result = new HashMap();
+        result.put("stream", streamId);
+        CommonAggregateStats commonStats = componentAggregateStats.get_common_stats();
+        result.put("emitted", nullToZero(commonStats.get_emitted()));
+        result.put("transferred", nullToZero(commonStats.get_transferred()));
+        result.put("completeLatency", StatsUtil.floatStr(spoutAggregateStats.get_complete_latency_ms()));
+        result.put("acked", nullToZero(commonStats.get_acked()));
+        result.put("failed", nullToZero(commonStats.get_failed()));
+        return result;
+    }
+
+    /**
+     * getBoltExecutorStats.
+     * @param topologyId topologyId
+     * @param config config
+     * @param executorAggregateStats executorAggregateStats
+     * @return getBoltExecutorStats
+     */
+    private static Map<String, Object> getBoltExecutorStats(String topologyId, Map<String, Object> config,
+                                                            ExecutorAggregateStats executorAggregateStats) {
+        Map<String, Object> result = new HashMap();
+        ExecutorSummary executorSummary = executorAggregateStats.get_exec_summary();
+        ExecutorInfo executorInfo = executorSummary.get_executor_info();
+        String executorId = prettyExecutorInfo(executorInfo);
+        result.put("id", executorId);
+        result.put("encodedId", Utils.urlEncodeUtf8(executorId));
+        result.put("uptime", prettyUptimeSec(executorSummary.get_uptime_secs()));
+        result.put("uptimeSeconds", executorSummary.get_uptime_secs());
+        String host = executorSummary.get_host();
+        result.put("host", host);
+        int port = executorSummary.get_port();
+        result.put("port", port);
+        
+        ComponentAggregateStats componentAggregateStats = executorAggregateStats.get_stats();
+        CommonAggregateStats commonAggregateStats = componentAggregateStats.get_common_stats();
+        result.put("emitted", nullToZero(commonAggregateStats.get_emitted()));
+        result.put("transferred", nullToZero(commonAggregateStats.get_transferred()));
+        
+        SpecificAggregateStats specificAggregateStats = componentAggregateStats.get_specific_stats();
+        BoltAggregateStats boltAggregateStats = specificAggregateStats.get_bolt();
+        result.put("capacity",  StatsUtil.floatStr(nullToZero(boltAggregateStats.get_capacity())));
+        result.put("executeLatency", StatsUtil.floatStr(boltAggregateStats.get_execute_latency_ms()));
+        result.put("executed", nullToZero(boltAggregateStats.get_executed()));
+        result.put("processLatency", StatsUtil.floatStr(boltAggregateStats.get_process_latency_ms()));
+        result.put("acked", nullToZero(commonAggregateStats.get_acked()));
+        result.put("failed", nullToZero(commonAggregateStats.get_failed()));
+        result.put("workerLogLink", getWorkerLogLink(host, port, config, topologyId));
+        return result;
+    }
+
+    /**
+     * getSpoutExecutorStats.
+     * @param topologyId topologyId
+     * @param config config
+     * @param executorAggregateStats executorAggregateStats
+     * @return getSpoutExecutorStats
+     */
+    private static Map<String, Object> getSpoutExecutorStats(String topologyId, Map<String, Object> config,
+                                                             ExecutorAggregateStats executorAggregateStats) {
+        Map<String, Object> result = new HashMap();
+        ExecutorSummary executorSummary = executorAggregateStats.get_exec_summary();
+        ExecutorInfo executorInfo = executorSummary.get_executor_info();
+        ComponentAggregateStats componentAggregateStats = executorAggregateStats.get_stats();
+        SpecificAggregateStats specificAggregateStats = componentAggregateStats.get_specific_stats();
+        SpoutAggregateStats spoutAggregateStats = specificAggregateStats.get_spout();
+        CommonAggregateStats commonAggregateStats = componentAggregateStats.get_common_stats();
+        String executorId = prettyExecutorInfo(executorInfo);
+        result.put("id", executorId);
+        result.put("encodedId", Utils.urlEncodeUtf8(executorId));
+        result.put("uptime", prettyUptimeSec(executorSummary.get_uptime_secs()));
+        result.put("uptimeSeconds", executorSummary.get_uptime_secs());
+        String host = executorSummary.get_host();
+        result.put("host", host);
+        int port = executorSummary.get_port();
+        result.put("port", port);
+        result.put("emitted", nullToZero(commonAggregateStats.get_emitted()));
+        result.put("transferred", nullToZero(commonAggregateStats.get_transferred()));
+        result.put("completeLatency", StatsUtil.floatStr(spoutAggregateStats.get_complete_latency_ms()));
+        result.put("acked", nullToZero(commonAggregateStats.get_acked()));
+        result.put("failed", nullToZero(commonAggregateStats.get_failed()));
+        result.put("workerLogLink", getWorkerLogLink(host, port, config, topologyId));
+        return result;
+    }
+
+    /**
+     * getComponentLastErrorInfo.
+     * Internal helper method that populates a hashmap with the component's most recently reported error.
+     * If the component has no such error reported, an empty "template" suitable for return over the
+     * REST api is returned.
+     *
+     * @param lastError errorInfo The components most recently reported error.
+     * @param config config Topology configuration map.
+     * @param topologyId topologyId.
+     * @return Map of values representing details about the most recently reported error.
+     */
+    private static Map<String, Object> getComponentLastErrorInfo(ErrorInfo lastError, Map config, String topologyId) {
+        Map<String, Object> result = new HashMap<>();
+
+        // Maintain backwards compatibility by defaulting these fields to empty string or null.
+        // If the lastError parameter is non-null, these keys will be populated with the appropriate values below.
+        result.put("lastError", "");
+        result.put("errorHost", "");
+        result.put("errorPort", (Integer) null);
+        result.put("errorWorkerLogLink", "");
+        result.put("errorTime", null);
+        result.put("errorLapsedSecs", null);
+
+        if (!Objects.isNull(lastError)) {
+            result.putAll(getComponentErrorInfo(lastError, config, topologyId, true));
+        }
+        return result;
+    }
+
+    /**
+     * getComponentErrorInfo.
+     * @param errorInfo errorInfo
+     * @param config config
+     * @param topologyId topologyId
+     * @param asLastError Pass a value of true if the result is to be used as part of a components 'lastError' response.
+     *                    Pass a value of false if the result is to be used as part of a components 'errors' response.
+     * @return getComponentErrorInfo
+     */
+    private static Map<String, Object> getComponentErrorInfo(ErrorInfo errorInfo, Map config,
+                                                             String topologyId, boolean asLastError) {
+        Map<String, Object> result = new HashMap();
+        result.put("errorTime",
+                errorInfo.get_error_time_secs());
+        String host = errorInfo.get_host();
+        result.put("errorHost", host);
+        int port = errorInfo.get_port();
+        result.put("errorPort", port);
+        result.put("errorWorkerLogLink", getWorkerLogLink(host, port, config, topologyId));
+        result.put("errorLapsedSecs", Time.deltaSecs(errorInfo.get_error_time_secs()));
+
+        if (asLastError) {
+            result.put("lastError", getTruncatedErrorString(errorInfo.get_error()));
+        } else {
+            result.put("error", errorInfo.get_error());
+        }
+
+        return result;
+    }
+
+    /**
+     * getComponentErrors.
+     * @param errorInfoList errorInfoList
+     * @param topologyId topologyId
+     * @param config config
+     * @return getComponentErrors
+     */
+    private static Map<String, Object> getComponentErrors(List<ErrorInfo> errorInfoList,
+                                                          String topologyId, Map config) {
+        Map<String, Object> result = new HashMap();
+        errorInfoList.sort(Comparator.comparingInt(ErrorInfo::get_error_time_secs));
+        result.put(
+                "componentErrors",
+                errorInfoList.stream().map(e -> getComponentErrorInfo(e, config, topologyId, false))
+                        .collect(Collectors.toList())
+        );
+        return result;
+    }
+
+    /**
+     * getTopologyErrors.
+     * @param errorInfoList errorInfoList
+     * @param topologyId topologyId
+     * @param config config
+     * @return getTopologyErrors
+     */
+    private static Map<String, Object> getTopologyErrors(List<ErrorInfo> errorInfoList,
+                                                         String topologyId, Map config) {
+        Map<String, Object> result = new HashMap();
+        errorInfoList.sort(Comparator.comparingInt(ErrorInfo::get_error_time_secs));
+        result.put(
+                "topologyErrors",
+                errorInfoList.stream().map(e -> getComponentErrorInfo(e, config, topologyId, false))
+                        .collect(Collectors.toList())
+        );
+        return result;
+    }
+
+    /**
+     * getTopologySpoutAggStatsMap.
+     * @param componentAggregateStats componentAggregateStats
+     * @param spoutId spoutId
+     * @return getTopologySpoutAggStatsMap
+     */
+    private static Map<String, Object> getTopologySpoutAggStatsMap(ComponentAggregateStats componentAggregateStats,
+                                                                   String spoutId, Map<String, Object> config, String topologyId) {
+        Map<String, Object> result = new HashMap();
+        CommonAggregateStats commonStats = componentAggregateStats.get_common_stats();
+        result.putAll(getCommonAggStatsMap(commonStats));
+        result.put("spoutId", spoutId);
+        result.put("encodedSpoutId", Utils.urlEncodeUtf8(spoutId));
+        SpoutAggregateStats spoutAggregateStats = componentAggregateStats.get_specific_stats().get_spout();
+        result.put("completeLatency", StatsUtil.floatStr(spoutAggregateStats.get_complete_latency_ms()));
+        result.putAll(getComponentLastErrorInfo(componentAggregateStats.get_last_error(), config, topologyId));
+        return result;
+    }
+
+    /**
+     * getTopologyBoltAggStatsMap.
+     * @param componentAggregateStats componentAggregateStats
+     * @param boltId boltId
+     * @return getTopologyBoltAggStatsMap
+     */
+    private static Map<String, Object> getTopologyBoltAggStatsMap(ComponentAggregateStats componentAggregateStats,
+                                                                  String boltId, Map<String, Object> config, String topologyId) {
+        Map<String, Object> result = new HashMap();
+        CommonAggregateStats commonStats = componentAggregateStats.get_common_stats();
+        result.putAll(getCommonAggStatsMap(commonStats));
         result.put("boltId", boltId);
-        result.put("encodedBoltId", URLEncoder.encode(boltId));
+        result.put("encodedBoltId", Utils.urlEncodeUtf8(boltId));
         BoltAggregateStats boltAggregateStats = componentAggregateStats.get_specific_stats().get_bolt();
         result.put("capacity", StatsUtil.floatStr(boltAggregateStats.get_capacity()));
         result.put("executeLatency", StatsUtil.floatStr(boltAggregateStats.get_execute_latency_ms()));
         result.put("executed", boltAggregateStats.get_executed());
         result.put("processLatency", StatsUtil.floatStr(boltAggregateStats.get_process_latency_ms()));
+        result.putAll(getComponentLastErrorInfo(componentAggregateStats.get_last_error(), config, topologyId));
         return result;
     }
 
+    /**
+     * getTopologyStatsMap.
+     * @param topologyStats topologyStats
+     * @return getTopologyStatsMap
+     */
     private static List<Map> getTopologyStatsMap(TopologyStats topologyStats) {
         List<Map> result = new ArrayList();
 
@@ -1158,10 +1586,17 @@ public class UIHelpers {
         return result;
     }
 
-    private static Map<String,Object> unpackTopologyInfo(TopologyPageInfo topologyPageInfo, String window, Map<String,Object> config) {
+    /**
+     * unpackTopologyInfo.
+     * @param topologyPageInfo topologyPageInfo
+     * @param window window
+     * @param config config
+     * @return unpackTopologyInfo
+     */
+    private static Map<String, Object> unpackTopologyInfo(TopologyPageInfo topologyPageInfo, String window, Map<String, Object> config) {
         Map<String, Object> result = new HashMap();
         result.put("id", topologyPageInfo.get_id());
-        result.put("encodedId", URLEncoder.encode(topologyPageInfo.get_id()));
+        result.put("encodedId", Utils.urlEncodeUtf8(topologyPageInfo.get_id()));
         result.put("owner", topologyPageInfo.get_owner());
         result.put("name", topologyPageInfo.get_name());
         result.put("status", topologyPageInfo.get_status());
@@ -1186,10 +1621,12 @@ public class UIHelpers {
         result.put("requestedSharedOnHeapMem", topologyPageInfo.get_requested_shared_on_heap_memory());
         result.put("requestedRegularOffHeapMem", topologyPageInfo.get_requested_regular_off_heap_memory());
         result.put("requestedSharedOffHeapMem", topologyPageInfo.get_requested_shared_off_heap_memory());
+        result.put("requestedGenericResources", prettifyGenericResources(topologyPageInfo.get_requested_generic_resources()));
         result.put("assignedRegularOnHeapMem", topologyPageInfo.get_assigned_regular_on_heap_memory());
         result.put("assignedSharedOnHeapMem", topologyPageInfo.get_assigned_shared_on_heap_memory());
         result.put("assignedRegularOffHeapMem", topologyPageInfo.get_assigned_regular_off_heap_memory());
         result.put("assignedSharedOffHeapMem", topologyPageInfo.get_assigned_shared_off_heap_memory());
+        result.put("assignedGenericResources", prettifyGenericResources(topologyPageInfo.get_assigned_generic_resources()));
         result.put("topologyStats", getTopologyStatsMap(topologyPageInfo.get_topology_stats()));
         List<Map> workerSummaries = new ArrayList();
         if (topologyPageInfo.is_set_workers()) {
@@ -1203,7 +1640,7 @@ public class UIHelpers {
         List<Map> spoutStats = new ArrayList();
 
         for (Map.Entry<String, ComponentAggregateStats> spoutEntry : spouts.entrySet()) {
-            spoutStats.add(getSpoutAggStatsMap(spoutEntry.getValue(), spoutEntry.getKey()));
+            spoutStats.add(getTopologySpoutAggStatsMap(spoutEntry.getValue(), spoutEntry.getKey(), config, topologyPageInfo.get_id()));
         }
         result.put("spouts", spoutStats);
 
@@ -1211,7 +1648,7 @@ public class UIHelpers {
         List<Map> boltStats = new ArrayList();
 
         for (Map.Entry<String, ComponentAggregateStats> boltEntry : bolts.entrySet()) {
-            boltStats.add(getBoltAggStatsMap(boltEntry.getValue(), boltEntry.getKey()));
+            boltStats.add(getTopologyBoltAggStatsMap(boltEntry.getValue(), boltEntry.getKey(), config, topologyPageInfo.get_id()));
         }
         result.put("bolts", boltStats);
 
@@ -1264,8 +1701,9 @@ public class UIHelpers {
      * @param config config
      * @return getTopologyLag.
      */
-    public static Map<String, Map<String, Object>> getTopologyLag(StormTopology userTopology, Map<String,Object> config) {
-        return TopologySpoutLag.lag(userTopology, config);
+    public static Map<String, Map<String, Object>> getTopologyLag(StormTopology userTopology, Map<String, Object> config) {
+        Boolean disableLagMonitoring = (Boolean) (config.get(DaemonConfig.UI_DISABLE_SPOUT_LAG_MONITORING));
+        return disableLagMonitoring ? Collections.EMPTY_MAP : TopologySpoutLag.lag(userTopology, config);
     }
 
     /**
@@ -1329,11 +1767,11 @@ public class UIHelpers {
      * @param stats stats
      * @return sanitizeTransferredStats
      */
-    public static  Map<String, Map<String,Long>> sanitizeTransferredStats(Map<String, Map<String,Long>> stats) {
-        Map<String, Map<String,Long>> result = new HashMap();
-        for (Map.Entry<String, Map<String,Long>> entry : stats.entrySet()) {
-            Map<String,Long> temp = new HashMap();
-            for (Map.Entry<String,Long> innerEntry : entry.getValue().entrySet()) {
+    public static  Map<String, Map<String, Long>> sanitizeTransferredStats(Map<String, Map<String, Long>> stats) {
+        Map<String, Map<String, Long>> result = new HashMap();
+        for (Map.Entry<String, Map<String, Long>> entry : stats.entrySet()) {
+            Map<String, Long> temp = new HashMap();
+            for (Map.Entry<String, Long> innerEntry : entry.getValue().entrySet()) {
                 temp.put(sanitizeStreamName(innerEntry.getKey()), innerEntry.getValue());
             }
             result.put(entry.getKey(), temp);
@@ -1365,7 +1803,7 @@ public class UIHelpers {
      * @param entryInput entryInput
      * @return getInputMap
      */
-    public static Map<String, Object> getInputMap(Map.Entry<GlobalStreamId,Grouping> entryInput) {
+    public static Map<String, Object> getInputMap(Map.Entry<GlobalStreamId, Grouping> entryInput) {
         Map<String, Object> result = new HashMap();
         result.put(":component", entryInput.getKey().get_componentId());
         result.put(":stream", entryInput.getKey().get_streamId());
@@ -1403,13 +1841,17 @@ public class UIHelpers {
                 Map<String, Object> spoutData = new HashMap();
                 spoutData.put(":type", "spout");
                 spoutData.put(":capacity", 0);
-                Map<String, Map> spoutStreamsStats = StatsUtil.spoutStreamsStats(spoutSummaries.get(spoutComponentId), true);
+                Map<String, Map> spoutStreamsStats =
+                    StatsUtil.spoutStreamsStats(spoutSummaries.get(spoutComponentId), sys);
                 spoutData.put(":latency", spoutStreamsStats.get("complete-latencies").get(window));
                 spoutData.put(":transferred", spoutStreamsStats.get("transferred").get(window));
                 spoutData.put(":stats", spoutSummaries.get(
                         spoutComponentId).stream().map(
                                 UIHelpers::getStatMapFromExecutorSummary).collect(Collectors.toList()));
-                spoutData.put(":link", UIHelpers.urlFormat("/component.html?id=%s&topology_id=%s", spoutComponentId, topoId));
+                spoutData.put(
+                        ":link",
+                        UIHelpers.urlFormat("/component.html?id=%s&topology_id=%s", spoutComponentId, topoId)
+                );
 
                 spoutData.put(":inputs",
                     spoutSpecMapEntry.getValue().get_common().get_inputs().entrySet().stream().map(
@@ -1425,13 +1867,17 @@ public class UIHelpers {
                 Map<String, Object> boltMap = new HashMap();
                 boltMap.put(":type", "bolt");
                 boltMap.put(":capacity", StatsUtil.computeBoltCapacity(boltSummaries.get(boltComponentId)));
-                Map<String, Map> boltStreamsStats = StatsUtil.boltStreamsStats(boltSummaries.get(boltComponentId), true);
+                Map<String, Map> boltStreamsStats =
+                        StatsUtil.boltStreamsStats(boltSummaries.get(boltComponentId), sys);
                 boltMap.put(":latency", boltStreamsStats.get("process-latencies").get(window));
                 boltMap.put(":transferred", boltStreamsStats.get("transferred").get(window));
                 boltMap.put(":stats", boltSummaries.get(
                         boltComponentId).stream().map(
                         UIHelpers::getStatMapFromExecutorSummary).collect(Collectors.toList()));
-                boltMap.put(":link", UIHelpers.urlFormat("/component.html?id=%s&topology_id=%s", boltComponentId, topoId));
+                boltMap.put(
+                        ":link",
+                        UIHelpers.urlFormat("/component.html?id=%s&topology_id=%s", boltComponentId, topoId)
+                );
 
                 boltMap.put(":inputs",
                         boltEntry.getValue().get_common().get_inputs().entrySet().stream().map(
@@ -1488,11 +1934,11 @@ public class UIHelpers {
     public static Map<String, Object> getActiveAction(ProfileRequest profileRequest, Map config, String topologyId) {
         Map<String, Object> result = new HashMap();
         result.put("host", profileRequest.get_nodeInfo().get_node());
-        result.put("port", String.valueOf(profileRequest.get_nodeInfo().get_port().iterator().next()));
+        result.put("port", String.valueOf(profileRequest.get_nodeInfo().get_port().toArray()[0]));
         result.put("dumplink",
                 getWorkerDumpLink(
                         profileRequest.get_nodeInfo().get_node(),
-                        profileRequest.get_nodeInfo().get_port().iterator().next(), topologyId, config
+                        (Long) profileRequest.get_nodeInfo().get_port().toArray()[0], topologyId, config
                         ));
         result.put("timestamp", System.currentTimeMillis() - profileRequest.get_time_stamp());
         return result;
@@ -1515,6 +1961,7 @@ public class UIHelpers {
 
     /**
      * getWorkerDumpLink.
+     *
      * @param host host
      * @param port port
      * @param topologyId topologyId
@@ -1524,20 +1971,97 @@ public class UIHelpers {
     public static String getWorkerDumpLink(String host, long port, String topologyId, Map<String, Object> config) {
         if (isSecureLogviewer(config)) {
             return UIHelpers.urlFormat(
-                    "https://%s:%s/api/v1/dumps/%s/%s",
-                    URLEncoder.encode(host), config.get(DaemonConfig.LOGVIEWER_HTTPS_PORT),
-                    URLEncoder.encode(topologyId),
-                    URLEncoder.encode(host) + ":" + URLEncoder.encode(String.valueOf(port))
+                "https://%s:%s/api/v1/dumps/%s/%s",
+                Utils.urlEncodeUtf8(host), config.get(DaemonConfig.LOGVIEWER_HTTPS_PORT),
+                Utils.urlEncodeUtf8(topologyId),
+                Utils.urlEncodeUtf8(host)
+                + ":" + Utils.urlEncodeUtf8(String.valueOf(port))
             );
         } else {
             return UIHelpers.urlFormat(
-                    "http://%s:%s/api/v1/dumps/%s/%s",
-                    URLEncoder.encode(host), config.get(DaemonConfig.LOGVIEWER_PORT),
-                    URLEncoder.encode(topologyId),
-                    URLEncoder.encode(host) + ":" + URLEncoder.encode(String.valueOf(port))
+                "http://%s:%s/api/v1/dumps/%s/%s",
+                Utils.urlEncodeUtf8(host), config.get(DaemonConfig.LOGVIEWER_PORT),
+                Utils.urlEncodeUtf8(topologyId),
+                Utils.urlEncodeUtf8(host) + ":" + Utils.urlEncodeUtf8(String.valueOf(port))
             );
         }
+    }
 
+    /**
+     * unpackBoltPageInfo.
+     * @param componentPageInfo componentPageInfo
+     * @param topologyId topologyId
+     * @param window window
+     * @param sys sys
+     * @param config config
+     * @return unpackBoltPageInfo
+     */
+    public static Map<String, Object> unpackBoltPageInfo(ComponentPageInfo componentPageInfo,
+                                                         String topologyId, String window, boolean sys,
+                                                         Map config) {
+        Map<String, Object> result = new HashMap<>();
+
+        result.put(
+            "boltStats",
+            componentPageInfo.get_window_to_stats().entrySet().stream().map(
+                e -> getBoltAggStatsMap(e.getValue(), e.getKey())
+            ).collect(Collectors.toList())
+        );
+        result.put(
+            "inputStats",
+            componentPageInfo.get_gsid_to_input_stats().entrySet().stream().map(
+                e -> getBoltInputStats(e.getKey(), e.getValue())
+            ).collect(Collectors.toList())
+        );
+        result.put(
+            "outputStats",
+            componentPageInfo.get_sid_to_output_stats().entrySet().stream().map(
+                e -> getBoltOutputStats(e.getKey(), e.getValue())
+            ).collect(Collectors.toList())
+        );
+        result.put(
+            "executorStats",
+            componentPageInfo.get_exec_stats().stream().map(
+                e -> getBoltExecutorStats(topologyId, config, e)
+            ).collect(Collectors.toList())
+        );
+        result.putAll(getComponentErrors(componentPageInfo.get_errors(), topologyId, config));
+        return result;
+    }
+
+    /**
+     * unpackSpoutPageInfo.
+     * @param componentPageInfo componentPageInfo
+     * @param topologyId topologyId
+     * @param window window
+     * @param sys sys
+     * @param config config
+     * @return unpackSpoutPageInfo
+     */
+    public static Map<String, Object> unpackSpoutPageInfo(ComponentPageInfo componentPageInfo,
+                                                          String topologyId, String window, boolean sys,
+                                                          Map config) {
+        Map<String, Object> result = new HashMap<>();
+        result.put(
+            "spoutSummary",
+            componentPageInfo.get_window_to_stats().entrySet().stream().map(
+                e -> getSpoutAggStatsMap(e.getValue(), e.getKey())
+            ).collect(Collectors.toList())
+        );
+        result.put(
+            "outputStats",
+            componentPageInfo.get_sid_to_output_stats().entrySet().stream().map(
+                e -> getSpoutOutputStats(e.getKey(), e.getValue())
+            ).collect(Collectors.toList())
+        );
+        result.put(
+            "executorStats",
+            componentPageInfo.get_exec_stats().stream().map(
+                e -> getSpoutExecutorStats(topologyId, config, e)
+            ).collect(Collectors.toList())
+        );
+        result.putAll(getComponentErrors(componentPageInfo.get_errors(), topologyId, config));
+        return result;
     }
 
     /**
@@ -1559,9 +2083,16 @@ public class UIHelpers {
         ComponentPageInfo componentPageInfo = client.getComponentPageInfo(
                 id, component, window, sys
         );
+
+        if (componentPageInfo.get_component_type().equals(ComponentType.BOLT)) {
+            result.putAll(unpackBoltPageInfo(componentPageInfo, id, window, sys, config));
+        } else if ((componentPageInfo.get_component_type().equals(ComponentType.SPOUT))) {
+            result.putAll(unpackSpoutPageInfo(componentPageInfo, id, window, sys, config));
+        }
+
         result.put("user", user);
         result.put("id" , component);
-        result.put("encodedId", URLEncoder.encode(component));
+        result.put("encodedId", Utils.urlEncodeUtf8(component));
         result.put("name", componentPageInfo.get_topology_name());
         result.put("executors", componentPageInfo.get_num_executors());
         result.put("tasks", componentPageInfo.get_num_tasks());
@@ -1571,11 +2102,13 @@ public class UIHelpers {
                 componentPageInfo.get_resources_map().get(Constants.COMMON_OFFHEAP_MEMORY_RESOURCE_NAME));
         result.put("requestedCpu",
                 componentPageInfo.get_resources_map().get(Constants.COMMON_CPU_RESOURCE_NAME));
+        result.put("requestedGenericResources",
+                prettifyGenericResources(componentPageInfo.get_resources_map()));
 
         result.put("schedulerDisplayResource", config.get(DaemonConfig.SCHEDULER_DISPLAY_RESOURCE));
         result.put("topologyId", id);
         result.put("topologyStatus", componentPageInfo.get_topology_status());
-        result.put("encodedTopologyId", URLEncoder.encode(id));
+        result.put("encodedTopologyId", Utils.urlEncodeUtf8(id));
         result.put("window", window);
         result.put("componentType", componentPageInfo.get_component_type().toString().toLowerCase());
         result.put("windowHint", getWindowHint(window));
@@ -1585,9 +2118,12 @@ public class UIHelpers {
             samplingPct = componentPageInfo.get_debug_options().get_samplingpct();
         }
         result.put("samplingPct", samplingPct);
-        result.put("eventLogLink", getLogviewerLink(componentPageInfo.get_eventlog_host(),
-                WebAppUtils.eventLogsFilename(id, String.valueOf(componentPageInfo.get_eventlog_port())),
-                config, componentPageInfo.get_eventlog_port()));
+        String eventlogHost = componentPageInfo.get_eventlog_host();
+        if (null != eventlogHost && !eventlogHost.isEmpty()) {
+            result.put("eventLogLink", getLogviewerLink(eventlogHost,
+                    WebAppUtils.eventLogsFilename(id, String.valueOf(componentPageInfo.get_eventlog_port())),
+                    config, componentPageInfo.get_eventlog_port()));
+        }
         result.put("profilingAndDebuggingCapable", !Utils.isOnWindows());
         result.put("profileActionEnabled", config.get(DaemonConfig.WORKER_PROFILER_ENABLED));
 
@@ -1719,25 +2255,24 @@ public class UIHelpers {
     }
 
     /**
-     * getTopologyProfilingAction.
+     * setTopologyProfilingAction.
      * @param client client
      * @param id id
      * @param hostPort hostPort
-     * @param timeout timeout
+     * @param timestamp timestamp
      * @param config config
      * @param profileAction profileAction
      * @throws TException TException
      */
-    public static void getTopologyProfilingAction(
+    public static void setTopologyProfilingAction(
             Nimbus.Iface client, String id,
-            String hostPort, String timeout, Map<String,
+            String hostPort, Long timestamp, Map<String,
             Object> config, ProfileAction profileAction) throws TException {
         String host = hostPort.split(":")[0];
         Set<Long> ports = new HashSet();
         String port = hostPort.split(":")[1];
         ports.add(Long.valueOf(port));
         NodeInfo nodeInfo = new NodeInfo(host, ports);
-        Long timestamp = System.currentTimeMillis() + Long.valueOf(timeout);
         ProfileRequest profileRequest = new ProfileRequest(nodeInfo, profileAction);
         profileRequest.set_time_stamp(timestamp);
         client.setWorkerProfiler(id, profileRequest);
@@ -1756,7 +2291,9 @@ public class UIHelpers {
     public static Map<String, Object> getTopologyProfilingStart(Nimbus.Iface client, String id,
                                                                 String hostPort, String timeout,
                                                                 Map<String, Object> config) throws TException {
-        getTopologyProfilingAction(client, id , hostPort, timeout, config, ProfileAction.JPROFILE_START);
+        setTopologyProfilingAction(
+                client, id , hostPort, System.currentTimeMillis() + (Long.valueOf(timeout) * 60_000),
+                config, ProfileAction.JPROFILE_STOP);
         Map<String, Object> result = new HashMap();
         String host = hostPort.split(":")[0];
         String port = hostPort.split(":")[1];
@@ -1772,15 +2309,14 @@ public class UIHelpers {
      * @param client client
      * @param id id
      * @param hostPort hostPort
-     * @param timeout timeout
      * @param config config
      * @return getTopologyProfilingStop
      * @throws TException TException
      */
     public static Map<String, Object> getTopologyProfilingStop(Nimbus.Iface client, String id,
-                                                               String hostPort, String timeout,
+                                                               String hostPort,
                                                                Map<String, Object> config) throws TException {
-        getTopologyProfilingAction(client, id , hostPort, timeout, config, ProfileAction.JPROFILE_STOP);
+        setTopologyProfilingAction(client, id , hostPort, 0L, config, ProfileAction.JPROFILE_STOP);
         Map<String, Object> result = new HashMap();
         result.put("status", "ok");
         result.put("id", hostPort);
@@ -1803,15 +2339,28 @@ public class UIHelpers {
      * @param client client
      * @param id id
      * @param hostPort hostPort
-     * @param timeout timeout
      * @param config config
      * @return getTopologyProfilingDump
      * @throws TException TException
      */
     public static Map<String, Object> getTopologyProfilingDump(Nimbus.Iface client, String id, String hostPort,
-                                                               String timeout,
-                                                               Map<String,Object> config) throws TException {
-        getTopologyProfilingAction(client, id , hostPort, timeout, config, ProfileAction.JPROFILE_DUMP);
+                                                               Map<String, Object> config) throws TException {
+        setTopologyProfilingAction(
+                client, id , hostPort, System.currentTimeMillis(),
+                config, ProfileAction.JPROFILE_DUMP
+        );
+        Map<String, Object> result = new HashMap();
+        result.put("status", "ok");
+        result.put("id", hostPort);
+        return result;
+    }
+
+    public static Map<String, Object> getTopologyProfilingDumpJstack(Nimbus.Iface client, String id,
+                                                                     String hostPort, Map<String,
+                                                                     Object> config) throws TException {
+        setTopologyProfilingAction(
+                client, id , hostPort, System.currentTimeMillis(), config, ProfileAction.JSTACK_DUMP
+        );
         Map<String, Object> result = new HashMap();
         result.put("status", "ok");
         result.put("id", hostPort);
@@ -1823,15 +2372,16 @@ public class UIHelpers {
      * @param client client
      * @param id id
      * @param hostPort hostPort
-     * @param timeout timeout
      * @param config config
      * @return getTopologyProfilingRestartWorker
      * @throws TException TException
      */
     public static Map<String, Object> getTopologyProfilingRestartWorker(Nimbus.Iface client,
-                                                                        String id, String hostPort, String timeout,
-                                                                        Map<String,Object> config) throws TException {
-        getTopologyProfilingAction(client, id , hostPort, timeout, config, ProfileAction.JVM_RESTART);
+                                                                        String id, String hostPort,
+                                                                        Map<String, Object> config) throws TException {
+        setTopologyProfilingAction(
+                client, id , hostPort, System.currentTimeMillis(), config, ProfileAction.JVM_RESTART
+        );
         Map<String, Object> result = new HashMap();
         result.put("status", "ok");
         result.put("id", hostPort);
@@ -1843,15 +2393,13 @@ public class UIHelpers {
      * @param client client
      * @param id id
      * @param hostPort hostport
-     * @param timeout timeout
      * @param config config
      * @return getTopologyProfilingDumpHeap
      * @throws TException TException
      */
     public static Map<String, Object> getTopologyProfilingDumpHeap(Nimbus.Iface client, String id, String hostPort,
-                                                                   String timeout,
-                                                                   Map<String,Object> config) throws TException {
-        getTopologyProfilingAction(client, id , hostPort, timeout, config, ProfileAction.JMAP_DUMP);
+                                                                   Map<String, Object> config) throws TException {
+        setTopologyProfilingAction(client, id , hostPort, System.currentTimeMillis(), config, ProfileAction.JMAP_DUMP);
         Map<String, Object> result = new HashMap();
         result.put("status", "ok");
         result.put("id", hostPort);
@@ -1895,7 +2443,7 @@ public class UIHelpers {
      * @param config config
      * @return getNimbusSummary
      */
-    public static Map<String, Object> getNimbusSummary(ClusterSummary clusterInfo, Map<String,Object> config) {
+    public static Map<String, Object> getNimbusSummary(ClusterSummary clusterInfo, Map<String, Object> config) {
         List<NimbusSummary> nimbusSummaries = clusterInfo.get_nimbuses();
         List<String> nimbusSeeds = new ArrayList();
         for (String nimbusHost : (List<String>) config.get(Config.NIMBUS_SEEDS)) {

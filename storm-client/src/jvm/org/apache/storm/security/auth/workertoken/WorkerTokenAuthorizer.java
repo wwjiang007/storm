@@ -12,6 +12,8 @@
 
 package org.apache.storm.security.auth.workertoken;
 
+import java.io.Closeable;
+import java.io.IOException;
 import java.util.Base64;
 import java.util.Map;
 import java.util.Optional;
@@ -39,9 +41,10 @@ import org.slf4j.LoggerFactory;
 /**
  * Allow for SASL authentication using worker tokens.
  */
-public class WorkerTokenAuthorizer implements PasswordProvider {
+public class WorkerTokenAuthorizer implements PasswordProvider, Closeable {
     private static final Logger LOG = LoggerFactory.getLogger(WorkerTokenAuthorizer.class);
     private final LoadingCache<WorkerTokenInfo, PrivateWorkerKey> keyCache;
+    private final IStormClusterState state;
 
     /**
      * Constructor.
@@ -72,6 +75,7 @@ public class WorkerTokenAuthorizer implements PasswordProvider {
                             });
         }
         keyCache = tmpKeyCache;
+        this.state = state;
     }
 
     private static IStormClusterState buildStateIfNeeded(Map<String, Object> conf, ThriftConnectionType connectionType) {
@@ -95,9 +99,13 @@ public class WorkerTokenAuthorizer implements PasswordProvider {
             throw new IllegalArgumentException("Token is not valid, token has expired.");
         }
 
-        PrivateWorkerKey key = keyCache.getUnchecked(deser);
-        if (key == null) {
-            throw new IllegalArgumentException("Token is not valid, private key not found.");
+        PrivateWorkerKey key;
+        try {
+            key = keyCache.getUnchecked(deser);
+        } catch (CacheLoader.InvalidCacheLoadException e) {
+            //This happens when the key is not found, the cache loader returns a null and this exception is thrown.
+            // because the cache cannot store a null.
+            throw new IllegalArgumentException("Token is not valid, private key not found.", e);
         }
 
         if (key.is_set_expirationTimeMillis() && key.get_expirationTimeMillis() <= Time.currentTimeMillis()) {
@@ -112,13 +120,21 @@ public class WorkerTokenAuthorizer implements PasswordProvider {
         if (keyCache == null) {
             return Optional.empty();
         }
+        byte[] user = null;
+        WorkerTokenInfo deser = null;
         try {
-            byte[] user = Base64.getDecoder().decode(userName);
-            WorkerTokenInfo deser = Utils.deserialize(user, WorkerTokenInfo.class);
+            user = Base64.getDecoder().decode(userName);
+            deser = Utils.deserialize(user, WorkerTokenInfo.class);
+        } catch (Exception e) {
+            LOG.info("Could not decode {}, might just be a plain digest request...", userName, e);
+            return Optional.empty();
+        }
+
+        try {
             byte[] password = getSignedPasswordFor(user, deser);
             return Optional.of(Base64.getEncoder().encodeToString(password).toCharArray());
         } catch (Exception e) {
-            LOG.debug("Could not decode {}, might just be a plain digest request...", userName, e);
+            LOG.error("Could not get password for token {}/{}", deser.get_userName(), deser.get_topologyId(), e);
             return Optional.empty();
         }
     }
@@ -128,5 +144,12 @@ public class WorkerTokenAuthorizer implements PasswordProvider {
         byte[] user = Base64.getDecoder().decode(userName);
         WorkerTokenInfo deser = Utils.deserialize(user, WorkerTokenInfo.class);
         return deser.get_userName();
+    }
+
+    @Override
+    public void close() {
+        if (state != null) {
+            state.disconnect();
+        }
     }
 }

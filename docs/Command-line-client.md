@@ -59,7 +59,7 @@ When you pass jars and/or artifacts options, StormSubmitter will upload them whe
 
 ### local
 
-Syntax: `storm jar topology-jar-path class ...`
+Syntax: `storm local topology-jar-path class ...`
 
 The local command acts just like `storm jar` except instead of submitting a topology to a cluster it will run the cluster in local mode.  This means an embedded version of the storm daemons will be run within the same process as your topology for 30 seconds before it shuts down automatically.  As such the classpath of your topology will be extended to include everything needed to run those daemons.
 
@@ -100,6 +100,8 @@ Rebalance will first deactivate the topology for the duration of the message tim
 The rebalance command can also be used to change the parallelism of a running topology. Use the -n and -e switches to change the number of workers or number of executors of a component respectively.
 
 ### repl
+
+*DEPRECATED: This subcommand may be removed in a future release.*
 
 Syntax: `storm repl`
 
@@ -299,7 +301,7 @@ e.g.
 
   ./bin/storm set_log_level -l com.myapp=WARN -l com.myOtherLogger=ERROR:123 topology-name
 
-  Set the com.myapp logger's level to WARN indifinitely, and com.myOtherLogger to ERROR for 123 seconds
+  Set the com.myapp logger's level to WARN indefinitely, and com.myOtherLogger to ERROR for 123 seconds
 
   ./bin/storm set_log_level -r com.myOtherLogger topology-name
 
@@ -317,7 +319,9 @@ eg: `storm shell resources/ python topology.py arg1 arg2`
 
 Syntax: `storm upload_credentials topology-name [credkey credvalue]*`
 
-Uploads a new set of credentials to a running topology
+Uploads a new set of credentials to a running topology  
+   * `-e --exception-when-empty`: optional flag. If set, command will fail and throw exception if no credentials were uploaded.
+   
 
 ### version
 

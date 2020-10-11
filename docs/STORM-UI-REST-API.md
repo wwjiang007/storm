@@ -192,7 +192,7 @@ Sample response:
             "host":"192.168.202.1",
             "port":6627,
             "nimbusLogLink":"http:\/\/192.168.202.1:8000\/log?file=nimbus.log",
-            "status":Leader,
+            "status":"Leader",
             "version":"0.10.0-SNAPSHOT",
             "nimbusUpTime":"3m 33s",
             "nimbusUpTimeSeconds":"213"
@@ -555,6 +555,9 @@ Response fields:
 |spouts.transferred| Long |Total number of messages  transferred in given window|
 |spouts.tasks| Integer |Total number of tasks for the spout|
 |spouts.lastError| String |Shows the last error happened in a spout|
+|spouts.errorHost| String | Worker hostname the last error was reported on|
+|spouts.errorPort| String | Worker port the last error was reported on|
+|spouts.errorTime| Integer | Unix timestamp the last error was reported (seconds since epoch) |
 |spouts.errorLapsedSecs| Integer | Number of seconds elapsed since that last error happened in a spout|
 |spouts.errorWorkerLogLink| String | Link to the worker log that reported the exception |
 |spouts.acked| Long |Number of messages acked|
@@ -572,6 +575,9 @@ Response fields:
 |bolts.acked| Long |Number of tuples acked by the bolt|
 |bolts.failed| Long |Number of tuples failed by the bolt|
 |bolts.lastError| String |Shows the last error occurred in the bolt|
+|bolts.errorHost| String | Worker hostname the last error was reported on|
+|bolts.errorPort| String | Worker port the last error was reported on|
+|bolts.errorTime| Integer | Unix timestamp the last error was reported (seconds since epoch) |
 |bolts.errorLapsedSecs| Integer |Number of seconds elapsed since that last error happened in a bolt|
 |bolts.errorWorkerLogLink| String | Link to the worker log that reported the exception |
 |bolts.emitted| Long |Number of tuples emitted|
@@ -687,6 +693,10 @@ Sample response:
             "spoutId": "spout",
             "tasks": 5,
             "lastError": "",
+            "errorHost": "",
+            "errorPort": null,
+            "errorWorkerLogLink": "",
+            "errorTime": null,
             "errorLapsedSecs": null,
             "failed": 0
         }
@@ -703,6 +713,10 @@ Sample response:
             "processLatency": "0.043",
             "boltId": "count",
             "lastError": "",
+            "errorHost": "",
+            "errorPort": null,
+            "errorWorkerLogLink": "",
+            "errorTime": null,
             "errorLapsedSecs": null,
             "capacity": "0.003",
             "failed": 0
@@ -717,8 +731,12 @@ Sample response:
             "executed": 28780,
             "processLatency": "2.112",
             "boltId": "split",
-            "lastError": "",
-            "errorLapsedSecs": null,
+            "lastError": "java.lang.RuntimeException: Error here! at org.apache.storm.starter.bolt.WordCountBolt.nextTuple(WordCountBolt.java:50) at org.apache.storm.executor.bolt.BoltExecutor$2.call",
+            "errorHost": "192.168.10.237",
+            "errorPort": 6707,
+            "errorWorkerLogLink": "http://192.168.10.237:8000/api/v1/log?file=WordCount3-1-1402960825%2F6707%2Fworker.log",
+            "errorTime": 1597626060,
+            "errorLapsedSecs": 65,
             "capacity": "0.000",
             "failed": 0
         }
@@ -1571,15 +1589,6 @@ Sample Response:
 ## API errors
 
 The API returns 500 HTTP status codes in case of any errors.
-
-Sample response:
-
-```json
-{
-  "error": "Internal Server Error",
-  "errorMessage": "java.lang.NullPointerException\n\tat clojure.core$name.invoke(core.clj:1505)\n\tat org.apache.storm.ui.core$component_page.invoke(core.clj:752)\n\tat org.apache.storm.ui.core$fn__7766.invoke(core.clj:782)\n\tat compojure.core$make_route$fn__5755.invoke(core.clj:93)\n\tat compojure.core$if_route$fn__5743.invoke(core.clj:39)\n\tat compojure.core$if_method$fn__5736.invoke(core.clj:24)\n\tat compojure.core$routing$fn__5761.invoke(core.clj:106)\n\tat clojure.core$some.invoke(core.clj:2443)\n\tat compojure.core$routing.doInvoke(core.clj:106)\n\tat clojure.lang.RestFn.applyTo(RestFn.java:139)\n\tat clojure.core$apply.invoke(core.clj:619)\n\tat compojure.core$routes$fn__5765.invoke(core.clj:111)\n\tat ring.middleware.reload$wrap_reload$fn__6880.invoke(reload.clj:14)\n\tat org.apache.storm.ui.core$catch_errors$fn__7800.invoke(core.clj:836)\n\tat ring.middleware.keyword_params$wrap_keyword_params$fn__6319.invoke(keyword_params.clj:27)\n\tat ring.middleware.nested_params$wrap_nested_params$fn__6358.invoke(nested_params.clj:65)\n\tat ring.middleware.params$wrap_params$fn__6291.invoke(params.clj:55)\n\tat ring.middleware.multipart_params$wrap_multipart_params$fn__6386.invoke(multipart_params.clj:103)\n\tat ring.middleware.flash$wrap_flash$fn__6675.invoke(flash.clj:14)\n\tat ring.middleware.session$wrap_session$fn__6664.invoke(session.clj:43)\n\tat ring.middleware.cookies$wrap_cookies$fn__6595.invoke(cookies.clj:160)\n\tat ring.adapter.jetty$proxy_handler$fn__6112.invoke(jetty.clj:16)\n\tat ring.adapter.jetty.proxy$org.mortbay.jetty.handler.AbstractHandler$0.handle(Unknown Source)\n\tat org.mortbay.jetty.handler.HandlerWrapper.handle(HandlerWrapper.java:152)\n\tat org.mortbay.jetty.Server.handle(Server.java:326)\n\tat org.mortbay.jetty.HttpConnection.handleRequest(HttpConnection.java:542)\n\tat org.mortbay.jetty.HttpConnection$RequestHandler.headerComplete(HttpConnection.java:928)\n\tat org.mortbay.jetty.HttpParser.parseNext(HttpParser.java:549)\n\tat org.mortbay.jetty.HttpParser.parseAvailable(HttpParser.java:212)\n\tat org.mortbay.jetty.HttpConnection.handle(HttpConnection.java:404)\n\tat org.mortbay.jetty.bio.SocketConnector$Connection.run(SocketConnector.java:228)\n\tat org.mortbay.thread.QueuedThreadPool$PoolThread.run(QueuedThreadPool.java:582)\n"
-}
-```
 
 # DRPC REST API
 

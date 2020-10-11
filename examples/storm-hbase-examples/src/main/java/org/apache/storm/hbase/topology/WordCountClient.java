@@ -14,15 +14,17 @@ package org.apache.storm.hbase.topology;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HBaseConfiguration;
+import org.apache.hadoop.hbase.TableName;
+import org.apache.hadoop.hbase.client.ConnectionFactory;
 import org.apache.hadoop.hbase.client.Get;
-import org.apache.hadoop.hbase.client.HTable;
 import org.apache.hadoop.hbase.client.Result;
+import org.apache.hadoop.hbase.client.Table;
 import org.apache.hadoop.hbase.util.Bytes;
 
 /**
  * Connects to the 'WordCount' table and prints counts for each word.
  *
- * Assumes you have run (or are running) <code>PersistentWordCount</code>
+ * <p>Assumes you have run (or are running) <code>PersistentWordCount</code>
  */
 public class WordCountClient {
 
@@ -32,7 +34,7 @@ public class WordCountClient {
             config.set("hbase.rootdir", args[0]);
         }
 
-        HTable table = new HTable(config, "WordCount");
+        Table table = ConnectionFactory.createConnection(config).getTable(TableName.valueOf("WordCount"));
 
 
         for (String word : WordSpout.words) {
